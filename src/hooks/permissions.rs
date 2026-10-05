@@ -373,10 +373,7 @@ fn check_shell_wrapper_permissions(
 /// 4. `~/.claude/settings.local.json`
 ///
 /// Missing files and malformed JSON are silently skipped.
-///
-/// `rtk discover` checks thousands of transcript commands against these, so it
-/// loads them once up front and calls `check_command_with_rules` per command.
-pub(crate) fn load_permission_rules() -> (Vec<String>, Vec<String>, Vec<String>) {
+fn load_permission_rules() -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut deny_rules = Vec::new();
     let mut ask_rules = Vec::new();
     let mut allow_rules = Vec::new();
