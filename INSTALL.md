@@ -52,6 +52,12 @@ After installation, **verify you have the correct rtk**:
 rtk gain  # Must show the savings dashboard (not "command not found")
 ```
 
+### Quick Install (Windows)
+
+```powershell
+winget install rtk-ai.rtk
+```
+
 ### Alternative: Manual Installation
 
 ```bash
@@ -265,6 +271,7 @@ cargo uninstall rtk
 
 # If installed via package manager
 brew uninstall rtk          # macOS Homebrew
+winget uninstall rtk-ai.rtk # Windows winget
 sudo apt remove rtk         # Debian/Ubuntu
 sudo dnf remove rtk         # Fedora/RHEL
 ```
@@ -313,7 +320,7 @@ rtk playwright test # Filtered Playwright output (-94%)
 rtk pytest          # Filtered Python tests (-90%)
 rtk rake test       # Filtered Ruby tests (-90%)
 rtk rspec           # Filtered RSpec tests (-60%)
-rtk test <cmd>      # Generic test wrapper - failures only (-90%)
+rtk test <cmd> [args...]  # Generic test wrapper - failures only (-90%)
 ```
 
 ### Statistics
@@ -381,11 +388,11 @@ cargo install --path . --force
 
 - **Website**: https://www.rtk-ai.app
 - **Contact**: contact@rtk-ai.app
-- **Troubleshooting**: See [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for common issues
+- **Troubleshooting**: See [TROUBLESHOOTING.md](docs/guide/resources/troubleshooting.md) for common issues
 - **GitHub issues**: https://github.com/rtk-ai/rtk/issues
 - **Pull Requests**: https://github.com/rtk-ai/rtk/pulls
 
-⚠️ **If you installed the wrong rtk (Type Kit)**, see [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#problem-rtk-gain-command-not-found)
+⚠️ **If you installed the wrong rtk (Type Kit)**, see [TROUBLESHOOTING.md](docs/guide/resources/troubleshooting.md)
 
 ## AI Assistant Checklist
 
