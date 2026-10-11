@@ -52,14 +52,6 @@ fn too_old_opencode(banner: Option<&str>) -> Option<String> {
     ((major, minor, patch) < MIN_OPENCODE).then(|| format!("{major}.{minor}.{patch}"))
 }
 
-/// Is this `opencode --version` banner older than `MIN_OPENCODE`?
-fn is_too_old(banner: &str) -> bool {
-    let Some((major, minor, patch)) = parse_version(banner) else {
-        return false;
-    };
-    (major, minor, patch) < MIN_OPENCODE
-}
-
 // Embedded Pi extension (auto-rewrite)
 // Stable code marker used to recognize a modified RTK extension without
 // relying on explanatory comments that users may remove. The marker matches
@@ -201,17 +193,22 @@ mod tests {
     // plugin function and refuses to start, which is why init says so out loud.
     #[test]
     fn version_floor_is_pinned() {
-        assert!(is_too_old("1.18.28"));
-        assert!(is_too_old("opencode 1.3.3"));
-        assert!(is_too_old("1.1.4"));
-        assert!(is_too_old("0.14.2"));
-        assert!(!is_too_old("1.18.29"));
-        assert!(!is_too_old("1.18.34"));
-        assert!(!is_too_old("2.0.22"));
+        for banner in ["1.18.28", "opencode 1.3.3", "1.1.4", "0.14.2"] {
+            assert!(too_old_opencode(Some(banner)).is_some(), "{banner}");
+        }
+        // The reported version is trimmed, so the message cannot wrap mid-sentence.
+        assert_eq!(
+            too_old_opencode(Some("opencode 1.1.4\nsome build note\n")).as_deref(),
+            Some("1.1.4")
+        );
+        for banner in ["1.18.29", "1.18.34", "1.19.0", "2.0.26"] {
+            assert_eq!(too_old_opencode(Some(banner)), None, "{banner}");
+        }
         // unreadable or unparsable is not evidence of an old OpenCode
-        assert!(!is_too_old(""));
-        assert!(!is_too_old("opencode (unknown)"));
-        assert!(!is_too_old("v"));
+        assert_eq!(too_old_opencode(None), None);
+        assert_eq!(too_old_opencode(Some("")), None);
+        assert_eq!(too_old_opencode(Some("opencode (unknown)")), None);
+        assert_eq!(too_old_opencode(Some("v")), None);
     }
 
     #[test]
