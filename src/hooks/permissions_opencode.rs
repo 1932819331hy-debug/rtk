@@ -126,13 +126,24 @@ pub(crate) fn check_command_with_opencode_rules(cmd: &str, rules: &[Rule]) -> Pe
 /// the opposite of what OpenCode does — and an out-ranked ask is an ask the
 /// rewrite would silence.
 pub(crate) fn load_opencode_rules(agent: Option<&str>) -> Vec<Rule> {
+    rules_from_configs(&opencode_configs(), agent)
+}
+
+/// The rules OpenCode resolves for `agent`, or `None` when a legacy key means a
+/// different rule to 1.x than to 2.x (see [`legacy_keys_depend_on_the_generation`]).
+pub(crate) fn load_judgeable_opencode_rules(agent: Option<&str>) -> Option<Vec<Rule>> {
     let configs = opencode_configs();
+    (!legacy_keys_depend_on_the_generation(&configs, agent))
+        .then(|| rules_from_configs(&configs, agent))
+}
+
+fn rules_from_configs(configs: &[Value], agent: Option<&str>) -> Vec<Rule> {
     let mut rules = Vec::new();
-    for config in &configs {
+    for config in configs {
         append_config_rules(config, None, &mut rules);
     }
     if let Some(agent) = agent {
-        for config in &configs {
+        for config in configs {
             append_config_rules(config, Some(agent), &mut rules);
         }
     }
@@ -144,6 +155,34 @@ pub(crate) fn load_opencode_rules(agent: Option<&str>) -> Vec<Rule> {
 /// so both spellings of the tool land on `bash`.
 fn permission_axis(name: &str) -> &str {
     if name == "shell" { "bash" } else { name }
+}
+
+/// Does a legacy `permission` map hold a shell rule only one OpenCode
+/// generation applies?
+///
+/// 1.x applies a legacy key that globs `bash`. 2.x renames the key `bash` to
+/// `shell` and applies any key that globs `shell`. The two disagree on keys
+/// like `shell` and `sh*` (2.x only) and `b*` (1.x only). rtk cannot tell which
+/// generation it is serving, and judging the rewrite against such a rule
+/// silences an ask on one of them, so the caller answers `{}`.
+fn legacy_keys_depend_on_the_generation(configs: &[Value], agent: Option<&str>) -> bool {
+    let generations_disagree = |key: &str| {
+        let applied_by_1x = wildcard_match("bash", key);
+        let applied_by_2x = key == "bash" || wildcard_match("shell", key);
+        applied_by_1x != applied_by_2x
+    };
+    let mut blocks = vec!["/permission".to_string()];
+    if let Some(name) = agent {
+        blocks.push(format!("/agent/{name}/permission"));
+        blocks.push(format!("/agents/{name}/permission"));
+    }
+    configs.iter().any(|config| {
+        blocks
+            .iter()
+            .filter_map(|block| config.pointer(block))
+            .filter_map(Value::as_object)
+            .any(|map| map.keys().any(|key| generations_disagree(key)))
+    })
 }
 
 /// One config's rules, in the order OpenCode resolves them: the legacy
@@ -170,17 +209,14 @@ fn append_config_rules(config: &Value, agent: Option<&str>, rules: &mut Vec<Rule
     append_permission_list(modern, rules);
 }
 
-/// Does this rule's action cover the `bash` axis?
+/// Does this 2.x list rule's action cover the shell tool?
 ///
-/// OpenCode matches the action as a glob, so `"sh*"` and `"*"` both cover
-/// `shell` while `"edit"` does not. Comparing only against the two exact
-/// spellings dropped a wildcard action that OpenCode would have applied, which
-/// is the same failure as missing the rule entirely.
-fn action_covers_bash(action: &str) -> bool {
-    wildcard_match("bash", action)
-        || wildcard_match("shell", action)
-        || wildcard_match("bash", &format!("{action} *"))
-        || wildcard_match("shell", &format!("{action} *"))
+/// OpenCode matches the action as a glob against `shell`, so `"sh*"` and `"*"`
+/// cover it while `"edit"` does not. `"bash"` does not either: in the 2.x list
+/// OpenCode applies no rule whose action only names the 1.x tool, and counting
+/// one would let an allow it ignores outrank an ask it applies.
+fn action_covers_shell(action: &str) -> bool {
+    wildcard_match("shell", action)
 }
 
 /// OpenCode 2.x's native rule list: `{ "action": "shell", "resource": "git *",
@@ -195,7 +231,7 @@ fn append_permission_list(list: Option<&Value>, rules: &mut Vec<Rule>) {
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if !action_covers_bash(action) {
+        if !action_covers_shell(action) {
             continue;
         }
         let Some(effect) = entry
@@ -288,20 +324,22 @@ fn agent_markdown_declares_rules(agent: &str) -> bool {
         return true; // not a plain id, so assume rules are somewhere we cannot see
     }
 
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = global_opencode_dir() {
-        dirs.push(dir.join(AGENTS_SUBDIR));
-    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    roots.extend(global_opencode_dir());
     if let Ok(start) = user_dirs::current_dir() {
-        dirs.extend(
-            user_dirs::ancestors(&start)
-                .map(|dir| dir.join(PROJECT_OPENCODE_SUBDIR).join(AGENTS_SUBDIR)),
-        );
+        roots.extend(user_dirs::ancestors(&start).map(|dir| dir.join(PROJECT_OPENCODE_SUBDIR)));
     }
-
-    dirs.iter().any(|dir| {
-        std::fs::read_to_string(dir.join(&name)).is_ok_and(|body| frontmatter_declares_rules(&body))
-    })
+    let name = name.as_str();
+    roots
+        .iter()
+        .flat_map(|root| {
+            AGENT_SUBDIRS
+                .iter()
+                .map(move |sub| root.join(sub).join(name))
+        })
+        .any(|file| {
+            std::fs::read_to_string(file).is_ok_and(|body| frontmatter_declares_rules(&body))
+        })
 }
 
 /// Could the active agent be carrying rules rtk cannot see?
@@ -316,21 +354,26 @@ pub(crate) fn agent_rules_unreadable(agent: Option<&str>) -> bool {
 /// Does this markdown frontmatter carry a `permission:` or `permissions:` key?
 fn frontmatter_declares_rules(body: &str) -> bool {
     let frontmatter = body
+        .trim_start_matches('\u{feff}')
         .strip_prefix("---")
-        .and_then(|rest| rest.split_once("\n---"))
-        .map(|(yaml, _)| yaml)
+        // An unclosed block still counts: a missed rule silences an ask.
+        .map(|rest| rest.split_once("\n---").map_or(rest, |(yaml, _)| yaml))
         .unwrap_or_default();
     frontmatter.lines().any(|line| {
         let line = line.trim_end();
         // Top-level only: an indented key belongs to some other block.
         !line.starts_with([' ', '\t', '-'])
-            && line
-                .split_once(':')
-                .is_some_and(|(key, _)| matches!(key.trim(), "permission" | "permissions"))
+            && line.split_once(':').is_some_and(|(key, _)| {
+                matches!(
+                    key.trim().trim_matches(['"', '\'']),
+                    "permission" | "permissions"
+                )
+            })
     })
 }
 
-const AGENTS_SUBDIR: &str = "agents";
+/// OpenCode loads agent files from both spellings of the directory.
+const AGENT_SUBDIRS: [&str; 2] = ["agents", "agent"];
 
 /// The project-level config directory is `.opencode`, not `opencode` like the
 /// one under `~/.config`.
@@ -699,11 +742,149 @@ mod tests {
     }
 
     #[test]
+    fn a_bash_action_in_the_2x_list_is_not_a_shell_rule() {
+        // OpenCode 2.x ignores a list rule whose action only names the 1.x
+        // tool. Counting this allow would put it after the shell ask, and the
+        // rewrite would silence that ask.
+        let config: Value = serde_json::from_str(
+            r#"{ "permissions": [
+                { "action": "shell", "resource": "ls *", "effect": "ask" },
+                { "action": "bash", "resource": "*", "effect": "allow" } ] }"#,
+        )
+        .expect("valid json");
+        let mut rules = Vec::new();
+        append_config_rules(&config, None, &mut rules);
+        assert_eq!(rules, vec![rule("ls *", Action::Ask)]);
+        assert_eq!(
+            check_command_with_opencode_rules("ls -la", &rules),
+            PermissionVerdict::Ask
+        );
+    }
+
+    #[test]
+    fn legacy_keys_one_generation_ignores_make_the_rules_version_dependent() {
+        let flagged = |config: &str, agent: Option<&str>| {
+            let tmp = test_isolation::tempdir();
+            let project = tmp.path().join("project");
+            write_json(&project.join("opencode.json"), config);
+            test_isolation::with_root(&tmp.path().join("home"), || {
+                let _entered = test_isolation::enter(&project);
+                legacy_keys_depend_on_the_generation(&opencode_configs(), agent)
+            })
+        };
+        assert!(flagged(
+            r#"{ "permission": { "bash": { "ls *": "ask" }, "shell": "allow" } }"#,
+            None
+        ));
+        assert!(flagged(
+            r#"{ "permission": { "sh*": { "ls *": "ask" } } }"#,
+            None
+        ));
+        assert!(
+            flagged(r#"{ "permission": { "b*": "allow" } }"#, None),
+            "1.x applies it, 2.x does not"
+        );
+        assert!(!flagged(
+            r#"{ "permission": { "bash": "ask", "*": "allow", "edit": "deny" } }"#,
+            None
+        ));
+        let agent_map = r#"{ "agent": { "build": { "permission": { "shell": "allow" } } } }"#;
+        assert!(
+            flagged(agent_map, Some("build")),
+            "an agent's own map counts for that agent"
+        );
+        assert!(!flagged(agent_map, None), "and only for that agent");
+        assert!(
+            flagged(
+                r#"{ "agents": { "build": { "permission": { "sh*": "allow" } } } }"#,
+                Some("build")
+            ),
+            "the 2.x agent block's legacy map counts too"
+        );
+        assert!(
+            !flagged(
+                r#"{ "permissions": [{ "action": "shell", "resource": "*", "effect": "allow" }] }"#,
+                None
+            ),
+            "the 2.x list exists only on 2.x, so it is not version dependent"
+        );
+    }
+
+    #[test]
+    fn frontmatter_rule_keys_are_found_in_every_top_level_spelling() {
+        let declares =
+            |front: &str| frontmatter_declares_rules(&format!("---\n{front}\n---\nbody\n"));
+        assert!(declares("permissions:\n  - action: shell"));
+        assert!(declares("permission:\n  bash: ask"));
+        assert!(declares("\"permissions\":\n  - action: shell"));
+        assert!(declares("'permission': {bash: ask}"));
+        assert!(declares("permissions :\n  - action: shell"));
+        assert!(
+            frontmatter_declares_rules("\u{feff}---\npermission: ask\n---\nbody\n"),
+            "a byte-order mark before the frontmatter"
+        );
+        assert!(
+            frontmatter_declares_rules("---\npermission:\n  bash: ask\n"),
+            "a frontmatter block that is never closed"
+        );
+        assert!(!declares("description: x\nmodel: y"));
+        assert!(
+            !declares("tools:\n  permissions: x"),
+            "an indented key belongs to another block"
+        );
+        assert!(
+            !frontmatter_declares_rules("---\ndescription: x\n---\npermissions: in the body\n"),
+            "the body is the prompt, not frontmatter"
+        );
+    }
+
+    #[test]
+    fn agent_files_are_looked_up_in_every_directory_opencode_reads() {
+        let rules = "---\npermissions:\n  - action: shell\n    resource: ls *\n    effect: ask\n---\nbody\n";
+        let tmp = test_isolation::tempdir();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        let nested = project.join("sub").join("dir");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        let write = |dir: PathBuf, name: &str| {
+            std::fs::create_dir_all(&dir).expect("create agent dir");
+            std::fs::write(dir.join(format!("{name}.md")), rules).expect("write agent file");
+        };
+        write(project.join(".opencode").join("agent"), "singular");
+        write(project.join(".opencode").join("agents"), "fromancestor");
+        write(
+            home.join(CONFIG_DIR).join(OPENCODE_SUBDIR).join("agents"),
+            "global",
+        );
+
+        test_isolation::with_root(&home, || {
+            let _entered = test_isolation::enter(&nested);
+            assert!(
+                agent_rules_unreadable(Some("singular")),
+                "the singular agent/ directory"
+            );
+            assert!(
+                agent_rules_unreadable(Some("fromancestor")),
+                "a .opencode above the cwd"
+            );
+            assert!(
+                agent_rules_unreadable(Some("global")),
+                "the global agents directory"
+            );
+            assert!(
+                agent_rules_unreadable(Some("team/reviewer")),
+                "a nested id fails closed"
+            );
+            assert!(!agent_rules_unreadable(Some("nowhere")));
+        });
+    }
+
+    #[test]
     fn a_markdown_agent_with_rules_makes_the_rewrite_step_aside() {
         let tmp = test_isolation::tempdir();
         let home = tmp.path().join("home");
         let project = tmp.path().join("project");
-        let agents = project.join(".opencode").join(AGENTS_SUBDIR);
+        let agents = project.join(".opencode").join("agents");
         std::fs::create_dir_all(&agents).expect("create agents directory");
         std::fs::write(
             agents.join("rtkprobe.md"),
@@ -727,7 +908,7 @@ mod tests {
         let tmp = test_isolation::tempdir();
         let home = tmp.path().join("home");
         let project = tmp.path().join("project");
-        let agents = project.join(".opencode").join(AGENTS_SUBDIR);
+        let agents = project.join(".opencode").join("agents");
         std::fs::create_dir_all(&agents).expect("create agents directory");
         std::fs::write(
             agents.join("plainer.md"),
