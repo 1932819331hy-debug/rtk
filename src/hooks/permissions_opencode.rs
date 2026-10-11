@@ -118,12 +118,22 @@ pub(crate) fn check_command_with_opencode_rules(cmd: &str, rules: &[Rule]) -> Pe
     PermissionVerdict::Default
 }
 
+/// Every config's rules, in the order OpenCode resolves them.
+///
+/// Two passes, not one loop over both: OpenCode applies the root rules of
+/// *every* file first, and only then the agent rules of every file. Reading
+/// them per file let a project root allow outrank a global agent ask, which is
+/// the opposite of what OpenCode does — and an out-ranked ask is an ask the
+/// rewrite would silence.
 pub(crate) fn load_opencode_rules(agent: Option<&str>) -> Vec<Rule> {
+    let configs = opencode_configs();
     let mut rules = Vec::new();
-    for config in opencode_configs() {
-        append_config_rules(&config, None, &mut rules);
-        if agent.is_some() {
-            append_config_rules(&config, agent, &mut rules);
+    for config in &configs {
+        append_config_rules(config, None, &mut rules);
+    }
+    if let Some(agent) = agent {
+        for config in &configs {
+            append_config_rules(config, Some(agent), &mut rules);
         }
     }
     rules
@@ -139,24 +149,38 @@ fn permission_axis(name: &str) -> &str {
 /// One config's rules, in the order OpenCode resolves them: the legacy
 /// `permission` map first, then the 2.x `permissions` list, regardless of which
 /// the file declares first — a legacy allow plus a list deny has to come out
-/// denied. With `agent`, this is the agent's own block and loads last.
+/// denied. The agent block reads the same way, in both of the spellings 1.x and
+/// 2.x used, and loads last.
 fn append_config_rules(config: &Value, agent: Option<&str>, rules: &mut Vec<Rule>) {
     let prefix = agent
         .map(|name| format!("/agents/{name}"))
         .unwrap_or_default();
     let legacy = config.pointer(&format!("{prefix}/permission"));
     let modern = config.pointer(&format!("{prefix}/permissions"));
+    // 1.x spelled the agent block `agent.<name>`; 2.x spells it
+    // `agents.<name>`. Both are legacy maps, so both precede the list.
+    let legacy_agent = agent.and_then(|name| config.pointer(&format!("/agent/{name}/permission")));
 
     if let Some(legacy) = legacy {
         append_rules(legacy, rules);
     }
-    append_permission_list(modern, rules);
-    // 1.x spelled it `agent.<name>`; 2.x spells it `agents.<name>`.
-    if let Some(legacy) =
-        agent.and_then(|name| config.pointer(&format!("/agent/{name}/permission")))
-    {
-        append_rules(legacy, rules);
+    if let Some(legacy_agent) = legacy_agent {
+        append_rules(legacy_agent, rules);
     }
+    append_permission_list(modern, rules);
+}
+
+/// Does this rule's action cover the `bash` axis?
+///
+/// OpenCode matches the action as a glob, so `"sh*"` and `"*"` both cover
+/// `shell` while `"edit"` does not. Comparing only against the two exact
+/// spellings dropped a wildcard action that OpenCode would have applied, which
+/// is the same failure as missing the rule entirely.
+fn action_covers_bash(action: &str) -> bool {
+    wildcard_match("bash", action)
+        || wildcard_match("shell", action)
+        || wildcard_match("bash", &format!("{action} *"))
+        || wildcard_match("shell", &format!("{action} *"))
 }
 
 /// OpenCode 2.x's native rule list: `{ "action": "shell", "resource": "git *",
@@ -171,7 +195,7 @@ fn append_permission_list(list: Option<&Value>, rules: &mut Vec<Rule>) {
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if action != "shell" && action != "*" {
+        if !action_covers_bash(action) {
             continue;
         }
         let Some(effect) = entry
@@ -246,6 +270,71 @@ fn opencode_configs() -> Vec<Value> {
 fn global_opencode_dir() -> Option<PathBuf> {
     Some(user_dirs::home()?.join(CONFIG_DIR).join(OPENCODE_SUBDIR))
 }
+
+/// Does the agent's markdown file declare permission rules?
+///
+/// Agents can be markdown files with a YAML frontmatter rather than a config
+/// entry, and OpenCode reads the rules from both. rtk reads the configs but not
+/// the files, so an ask or a deny declared only in a file was invisible and the
+/// rewrite silenced it. The rules themselves are not parsed — only the presence
+/// of a `permission:` or `permissions:` key matters, and when one is there the
+/// answer is `{}`, which is the safe direction.
+///
+/// An agent file with no such key keeps its rewrites, since most of them carry
+/// only a prompt and a model.
+fn agent_markdown_declares_rules(agent: &str) -> bool {
+    let name = format!("{agent}.md");
+    if name.contains('/') || name.contains('\\') {
+        return true; // not a plain id, so assume rules are somewhere we cannot see
+    }
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = global_opencode_dir() {
+        dirs.push(dir.join(AGENTS_SUBDIR));
+    }
+    if let Ok(start) = user_dirs::current_dir() {
+        dirs.extend(
+            user_dirs::ancestors(&start)
+                .map(|dir| dir.join(PROJECT_OPENCODE_SUBDIR).join(AGENTS_SUBDIR)),
+        );
+    }
+
+    dirs.iter().any(|dir| {
+        std::fs::read_to_string(dir.join(&name)).is_ok_and(|body| frontmatter_declares_rules(&body))
+    })
+}
+
+/// Could the active agent be carrying rules rtk cannot see?
+///
+/// True when an agent markdown file exists and declares a `permission:` or
+/// `permissions:` key. The rules themselves are not parsed; the caller answers
+/// `{}`, which is the safe direction.
+pub(crate) fn agent_rules_unreadable(agent: Option<&str>) -> bool {
+    agent.is_some_and(agent_markdown_declares_rules)
+}
+
+/// Does this markdown frontmatter carry a `permission:` or `permissions:` key?
+fn frontmatter_declares_rules(body: &str) -> bool {
+    let frontmatter = body
+        .strip_prefix("---")
+        .and_then(|rest| rest.split_once("\n---"))
+        .map(|(yaml, _)| yaml)
+        .unwrap_or_default();
+    frontmatter.lines().any(|line| {
+        let line = line.trim_end();
+        // Top-level only: an indented key belongs to some other block.
+        !line.starts_with([' ', '\t', '-'])
+            && line
+                .split_once(':')
+                .is_some_and(|(key, _)| matches!(key.trim(), "permission" | "permissions"))
+    })
+}
+
+const AGENTS_SUBDIR: &str = "agents";
+
+/// The project-level config directory is `.opencode`, not `opencode` like the
+/// one under `~/.config`.
+const PROJECT_OPENCODE_SUBDIR: &str = ".opencode";
 
 fn project_root_with_config() -> Option<PathBuf> {
     let start = user_dirs::current_dir().ok()?;
@@ -531,6 +620,124 @@ mod tests {
                 check_command_with_opencode_rules("git status", &rules),
                 PermissionVerdict::Allow
             );
+        });
+    }
+
+    #[test]
+    fn a_global_agent_ask_outranks_a_project_root_allow() {
+        // OpenCode reads every file's root rules first, then every file's agent
+        // rules. Reading them per file let the project allow win here, which
+        // silences an ask the user wrote.
+        let tmp = test_isolation::tempdir();
+        let home = tmp.path().join("home");
+        write_json(
+            &home
+                .join(CONFIG_DIR)
+                .join(OPENCODE_SUBDIR)
+                .join("opencode.json"),
+            r#"{ "agents": { "build": { "permissions": [
+                   { "action": "shell", "resource": "ls *", "effect": "ask" } ] } } }"#,
+        );
+        let project = tmp.path().join("project");
+        write_json(
+            &project.join("opencode.json"),
+            r#"{ "permissions": [ { "action": "shell", "resource": "*", "effect": "allow" } ] }"#,
+        );
+
+        test_isolation::with_root(&home, || {
+            let _entered = test_isolation::enter(&project);
+            let rules = load_opencode_rules(Some("build"));
+            assert_eq!(
+                rules,
+                vec![rule("*", Action::Allow), rule("ls *", Action::Ask),],
+                "project root allow first, global agent ask after"
+            );
+            assert_eq!(
+                check_command_with_opencode_rules("ls -la", &rules),
+                PermissionVerdict::Ask,
+                "the agent ask has to survive the project allow"
+            );
+        });
+    }
+
+    #[test]
+    fn a_legacy_agent_map_outranks_the_agent_list_in_the_same_file() {
+        // Both spellings are legacy maps, so both precede the 2.x list. Reading
+        // the list first let it decide over the map OpenCode would have used.
+        let config: Value = serde_json::from_str(
+            r#"{
+                "agent": { "build": { "permission": { "bash": { "*": "allow" } } } },
+                "agents": { "build": { "permissions": [
+                    { "action": "shell", "resource": "ls *", "effect": "ask" } ] } }
+            }"#,
+        )
+        .expect("valid json");
+        let mut rules = Vec::new();
+        append_config_rules(&config, Some("build"), &mut rules);
+        assert_eq!(
+            rules,
+            vec![rule("*", Action::Allow), rule("ls *", Action::Ask)],
+            "legacy map before the list, whichever order the file declares them"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_action_is_a_shell_rule_too() {
+        let config: Value = serde_json::from_str(
+            r#"{ "permissions": [
+                { "action": "sh*", "resource": "ls *", "effect": "ask" },
+                { "action": "edit", "resource": "ls *", "effect": "deny" } ] }"#,
+        )
+        .expect("valid json");
+        let mut rules = Vec::new();
+        append_config_rules(&config, None, &mut rules);
+        assert_eq!(
+            rules,
+            vec![rule("ls *", Action::Ask)],
+            "sh* covers the shell tool; edit is another tool and cannot match"
+        );
+    }
+
+    #[test]
+    fn a_markdown_agent_with_rules_makes_the_rewrite_step_aside() {
+        let tmp = test_isolation::tempdir();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        let agents = project.join(".opencode").join(AGENTS_SUBDIR);
+        std::fs::create_dir_all(&agents).expect("create agents directory");
+        std::fs::write(
+            agents.join("rtkprobe.md"),
+            "---\ndescription: probes\npermissions:\n  - action: shell\n    resource: ls *\n    effect: ask\n---\nbody\n",
+        )
+        .expect("write agent file");
+
+        test_isolation::with_root(&home, || {
+            let _entered = test_isolation::enter(&project);
+            assert!(agent_rules_unreadable(Some("rtkprobe")));
+            assert!(
+                !agent_rules_unreadable(Some("someotheragent")),
+                "an agent with no file keeps its rewrites"
+            );
+            assert!(!agent_rules_unreadable(None));
+        });
+    }
+
+    #[test]
+    fn an_agent_file_without_a_rules_key_keeps_its_rewrites() {
+        let tmp = test_isolation::tempdir();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        let agents = project.join(".opencode").join(AGENTS_SUBDIR);
+        std::fs::create_dir_all(&agents).expect("create agents directory");
+        std::fs::write(
+            agents.join("plainer.md"),
+            "---\ndescription: just a prompt\nmodel: anthropic/claude\n---\nbody\n",
+        )
+        .expect("write agent file");
+
+        test_isolation::with_root(&home, || {
+            let _entered = test_isolation::enter(&project);
+            assert!(!agent_rules_unreadable(Some("plainer")));
         });
     }
 

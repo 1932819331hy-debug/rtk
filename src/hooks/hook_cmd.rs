@@ -1203,6 +1203,13 @@ pub fn run_opencode(cmd: &str, agent: Option<&str>) -> Result<()> {
 
 /// [`opencode_answer`] against the rules OpenCode resolves for `agent`.
 fn opencode_answer_for(cmd: &str, agent: Option<&str>) -> Value {
+    // An agent can be a markdown file whose frontmatter declares permission
+    // rules. rtk reads the config files but not those, so a rewrite judged
+    // against the rules it *can* see would miss an ask or a deny written in the
+    // file and silence it. Answer `{}` and let OpenCode apply its own rules.
+    if permissions_opencode::agent_rules_unreadable(agent) {
+        return json!({});
+    }
     let rules = permissions_opencode::load_opencode_rules(agent);
     opencode_answer(cmd, &rules)
 }
@@ -2725,6 +2732,40 @@ mod tests {
                     super::super::opencode_answer_for("git status", None),
                     json!({ "command": "rtk git status" }),
                     "without the agent, no rule applies and the rewrite stands"
+                );
+            });
+        }
+
+        #[test]
+        fn a_markdown_agents_rules_stop_the_rewrite_entirely() {
+            use crate::core::test_isolation;
+
+            let tmp = test_isolation::tempdir();
+            let project = tmp.path().join("project");
+            let agents = project.join(".opencode").join("agents");
+            std::fs::create_dir_all(&agents).expect("create agents dir");
+            std::fs::write(
+                agents.join("rtkprobe.md"),
+                "---\ndescription: probes\npermissions:\n  - action: shell\n    resource: ls *\n    effect: ask\n---\nbody\n",
+            )
+            .expect("write agent file");
+            std::fs::write(
+                project.join(".opencode").join("agents").join("plainer.md"),
+                "---\ndescription: no rules here\nmodel: anthropic/claude\n---\nbody\n",
+            )
+            .expect("write plainer agent file");
+
+            test_isolation::with_root(&tmp.path().join("home"), || {
+                let _entered = test_isolation::enter(&project);
+                assert_eq!(
+                    super::super::opencode_answer_for("ls -la", Some("rtkprobe")),
+                    json!({}),
+                    "rules rtk cannot read means no rewrite at all"
+                );
+                assert_eq!(
+                    super::super::opencode_answer_for("ls -la", Some("plainer")),
+                    json!({ "command": "rtk ls -la" }),
+                    "an agent file with no rules key keeps the rewrite"
                 );
             });
         }
