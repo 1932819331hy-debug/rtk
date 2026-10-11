@@ -130,7 +130,7 @@ rtk init --global --gemini
 rtk init --global --opencode
 ```
 
-Installs the Claude Code setup and creates `~/.config/opencode/plugins/rtk.ts`. The plugin registers both OpenCode 2.0 (`execute.before`) and OpenCode 1.x (`tool.execute.before`) hooks, in one default export carrying both entrypoints. That shape needs OpenCode 1.18.29 or newer; on anything older the plugin does not load, and init says so.
+Installs the Claude Code setup and creates `~/.config/opencode/plugins/rtk.ts`. The plugin registers both OpenCode 2.0 (`execute.before`) and OpenCode 1.x (`tool.execute.before`) hooks, in one default export carrying both entrypoints. That shape needs OpenCode 1.18.29 or newer; on anything older the plugin does not load, and `rtk init` writes nothing and says so.
 
 ### Pi
 

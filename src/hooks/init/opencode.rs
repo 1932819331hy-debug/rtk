@@ -40,13 +40,16 @@ fn opencode_version() -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The installed version banner when that OpenCode is older than `MIN_OPENCODE`.
+/// The version when it is older than `MIN_OPENCODE`, as `x.y.z`.
 ///
 /// `None` for an OpenCode we could not ask, could not parse, or one that is new
-/// enough, so an unreadable version never turns into a complaint.
-fn too_old_opencode() -> Option<String> {
-    let out = opencode_version()?;
-    is_too_old(&out).then_some(out)
+/// enough, so an unreadable version never turns into a complaint. The banner
+/// itself is not reported: `opencode --version` prints more than the number on
+/// some builds, and the extra text breaks the message across lines.
+fn too_old_opencode(banner: Option<&str>) -> Option<String> {
+    let banner = banner?;
+    let (major, minor, patch) = parse_version(banner)?;
+    ((major, minor, patch) < MIN_OPENCODE).then(|| format!("{major}.{minor}.{patch}"))
 }
 
 /// Is this `opencode --version` banner older than `MIN_OPENCODE`?
@@ -88,9 +91,43 @@ pub(super) fn prepare_opencode_plugin_path() -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Write OpenCode plugin file if missing or outdated
+/// Write OpenCode plugin file if missing or outdated.
+///
+/// Below [`MIN_OPENCODE`] nothing is written and an existing file is left
+/// alone: those loaders call every export as `fn(input)`, which this plugin's
+/// object default is not, so writing it would leave OpenCode unable to start
+/// with no way back other than removing the file by hand. Saying so and
+/// changing nothing leaves whatever already works working.
 pub(super) fn ensure_opencode_plugin_installed(path: &Path, ctx: InitContext) -> Result<bool> {
+    let banner = opencode_version();
+    ensure_opencode_plugin_installed_for(path, ctx, banner.as_deref())
+}
+
+/// [`ensure_opencode_plugin_installed`] against an already-read version banner.
+///
+/// Taking the banner rather than spawning `opencode --version` here is what
+/// makes the no-write branch testable, and what stops the tests from running
+/// whatever OpenCode the developer happens to have installed.
+fn ensure_opencode_plugin_installed_for(
+    path: &Path,
+    ctx: InitContext,
+    banner: Option<&str>,
+) -> Result<bool> {
     let InitContext { dry_run, .. } = ctx;
+    if !dry_run && let Some(found) = too_old_opencode(banner) {
+        let need = format!("{}.{}.{}", MIN_OPENCODE.0, MIN_OPENCODE.1, MIN_OPENCODE.2);
+        let existing = if path.exists() {
+            "left the plugin that is already there in place"
+        } else {
+            "installed nothing"
+        };
+        println!(
+            "  [rtk] OpenCode {found} is older than {need} and cannot load this plugin, \
+             so {existing}.\n        \
+             Upgrade OpenCode, then re-run `rtk init -g --opencode`."
+        );
+        return Ok(false);
+    }
     // Ensure parent dir exists (skip in dry-run)
     if !dry_run && let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
@@ -99,13 +136,6 @@ pub(super) fn ensure_opencode_plugin_installed(path: &Path, ctx: InitContext) ->
                 parent.display()
             )
         })?;
-    }
-    if !dry_run && let Some(found) = too_old_opencode() {
-        let need = format!("{}.{}.{}", MIN_OPENCODE.0, MIN_OPENCODE.1, MIN_OPENCODE.2);
-        println!(
-            "  [rtk] OpenCode {found} is older than {need}, and the rtk plugin will not load there.\n        \
-             Upgrade OpenCode, then re-run `rtk init -g --opencode`."
-        );
     }
     write_if_changed(path, OPENCODE_PLUGIN, "OpenCode plugin", ctx)
 }
@@ -185,6 +215,60 @@ mod tests {
     }
 
     #[test]
+    fn an_old_opencode_leaves_the_plugin_file_untouched() {
+        // Writing it is what breaks startup, so the no-write branch is the one
+        // that matters: an existing plugin has to survive, and a missing one
+        // has to stay missing.
+        for banner in ["1.1.4", "1.3.3", "opencode 1.1.4\nsome build note\n"] {
+            let temp = TempDir::new().unwrap();
+            let plugin_path = opencode_plugin_path(&temp.path().join("opencode"));
+
+            fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
+            fs::write(&plugin_path, "// whatever was already there").unwrap();
+            let changed = ensure_opencode_plugin_installed_for(
+                &plugin_path,
+                InitContext::default(),
+                Some(banner),
+            )
+            .unwrap();
+            assert!(!changed, "{banner} must not report a change");
+            assert_eq!(
+                fs::read_to_string(&plugin_path).unwrap(),
+                "// whatever was already there",
+                "{banner} must not overwrite what was there"
+            );
+
+            fs::remove_file(&plugin_path).unwrap();
+            let wrote = ensure_opencode_plugin_installed_for(
+                &plugin_path,
+                InitContext::default(),
+                Some(banner),
+            )
+            .unwrap();
+            assert!(!wrote);
+            assert!(!plugin_path.exists(), "{banner} must not create the file");
+        }
+    }
+
+    #[test]
+    fn a_new_or_unreadable_opencode_still_gets_the_plugin() {
+        for banner in [
+            None,
+            Some("1.18.29"),
+            Some("2.0.26"),
+            Some("opencode (unknown)"),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let plugin_path = opencode_plugin_path(&temp.path().join("opencode"));
+            let changed =
+                ensure_opencode_plugin_installed_for(&plugin_path, InitContext::default(), banner)
+                    .unwrap();
+            assert!(changed, "{banner:?} must get the plugin");
+            assert_eq!(fs::read_to_string(&plugin_path).unwrap(), OPENCODE_PLUGIN);
+        }
+    }
+
+    #[test]
     fn test_opencode_plugin_install_and_update() {
         let temp = TempDir::new().unwrap();
         let opencode_dir = temp.path().join("opencode");
@@ -193,15 +277,18 @@ mod tests {
         fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
         assert!(!plugin_path.exists());
 
+        // No banner: this test is about the file, not the developer's OpenCode.
         let changed =
-            ensure_opencode_plugin_installed(&plugin_path, InitContext::default()).unwrap();
+            ensure_opencode_plugin_installed_for(&plugin_path, InitContext::default(), None)
+                .unwrap();
         assert!(changed);
         let content = fs::read_to_string(&plugin_path).unwrap();
         assert_eq!(content, OPENCODE_PLUGIN);
 
         fs::write(&plugin_path, "// old").unwrap();
         let changed_again =
-            ensure_opencode_plugin_installed(&plugin_path, InitContext::default()).unwrap();
+            ensure_opencode_plugin_installed_for(&plugin_path, InitContext::default(), None)
+                .unwrap();
         assert!(changed_again);
         let content_updated = fs::read_to_string(&plugin_path).unwrap();
         assert_eq!(content_updated, OPENCODE_PLUGIN);
