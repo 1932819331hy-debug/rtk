@@ -433,11 +433,14 @@ fn an_arbitrary_commands_flags_are_not_rtks_to_read() {
     let raw = run(&df, &["-h"]);
     for sub in ["err", "summary"] {
         let mine = run_rtk(&[sub, "df", "-h"]);
+        assert_ne!(
+            mine.text, raw.text,
+            "rtk {sub} df -h passed df's output through instead of filtering it"
+        );
         assert!(
-            mine.text.len() * 2 < raw.text.len(),
-            "rtk {sub} df -h returned {} bytes of df's {}, so it was not filtered",
-            mine.text.len(),
-            raw.text.len()
+            mine.text.starts_with("[ok]"),
+            "rtk {sub} df -h did not produce RTK's own summary; got: {}",
+            &mine.text[..mine.text.len().min(120)]
         );
     }
 }
