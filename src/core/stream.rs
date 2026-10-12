@@ -713,12 +713,18 @@ pub fn exec_capture(cmd: &mut Command) -> Result<CaptureResult> {
     capture(cmd)
 }
 
-/// Like [`exec_capture`] but inherits stdin so a wrapped engine can read a piped stdin.
+/// Like [`exec_capture`] but inherits stdin so a wrapped engine can read a piped stdin, and
+/// without the usage guard: its callers pass the caller's argv through verbatim or decide on
+/// it first.
 pub fn exec_capture_stdin(cmd: &mut Command) -> Result<CaptureResult> {
     cmd.stdin(Stdio::inherit());
     capture(cmd)
 }
 
+/// Like [`exec_capture`] without the usage guard, for an argv whose `--help`, `--version` or
+/// `-h` is not the caller asking the tool for its usage: a probe RTK runs for itself, or a
+/// command whose flags RTK does not read. A caller that has already answered the usage
+/// question on the caller's own argv uses it too.
 pub fn exec_capture_unguarded(cmd: &mut Command) -> Result<CaptureResult> {
     cmd.stdin(Stdio::null());
     capture(cmd)

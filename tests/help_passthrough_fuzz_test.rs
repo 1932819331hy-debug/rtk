@@ -328,8 +328,8 @@ fn grep_dash_h_searches_and_drops_the_filename() {
         eprintln!("skipped: grep not installed");
         return;
     };
-    let dir = std::env::temp_dir().join("rtk_4198_fuzz");
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let tmp = common::tempdir();
+    let dir = tmp.path();
     let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
     std::fs::write(&a, "alpha\nbeta\n").expect("write a");
     std::fs::write(&b, "alpha\ngamma\n").expect("write b");
@@ -354,15 +354,13 @@ fn grep_dash_h_searches_and_drops_the_filename() {
         );
         assert_eq!(mine.code, native.code, "exit code for {}", flags.join(" "));
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]
 #[test]
 fn a_caller_value_that_spells_a_help_token_is_not_a_request() {
-    let dir = std::env::temp_dir().join("rtk_4198_values");
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let tmp = common::tempdir();
+    let dir = tmp.path();
     let file = dir.join("flags.txt");
     std::fs::write(&file, "use --help for usage\nplain\nuse --version here\n").expect("write");
     let f = file.to_string_lossy().into_owned();
@@ -387,16 +385,14 @@ fn a_caller_value_that_spells_a_help_token_is_not_a_request() {
         );
         assert_eq!(mine.code, theirs.code, "{tool} {}", args.join(" "));
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]
 #[test]
 fn go_test_help_is_not_replayed_through_the_injected_json() {
     let Some(go) = on_path("go") else { return };
-    let dir = std::env::temp_dir().join("rtk_4198_gomod");
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let tmp = common::tempdir();
+    let dir = tmp.path();
     std::fs::write(dir.join("go.mod"), "module t\n\ngo 1.21\n").expect("write go.mod");
     std::fs::write(
         dir.join("t_test.go"),
@@ -406,11 +402,11 @@ fn go_test_help_is_not_replayed_through_the_injected_json() {
 
     let args = ["test", "./...", "-args", "-help"];
     let mut rtk_cmd = common::rtk_command();
-    rtk_cmd.current_dir(&dir).arg("go");
+    rtk_cmd.current_dir(dir).arg("go");
     let mine = finish(rtk_cmd, &args, "rtk");
 
     let mut go_cmd = common::native_command(&go.display().to_string());
-    go_cmd.current_dir(&dir);
+    go_cmd.current_dir(dir);
     let theirs = finish(go_cmd, &args, "go");
 
     assert!(
@@ -422,8 +418,6 @@ fn go_test_help_is_not_replayed_through_the_injected_json() {
         mine.text.contains("Usage of") && theirs.text.contains("Usage of"),
         "expected the test binary's usage from both sides"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]
@@ -433,8 +427,8 @@ fn an_arbitrary_commands_flags_are_not_rtks_to_read() {
 
     // Generated rather than `df -h`, whose 436 bytes on a CI runner are small enough that
     // RTK rightly returns them raw and the marker below cannot tell guard from size.
-    let dir = std::env::temp_dir().join("rtk_4198_dutree");
-    let _ = std::fs::remove_dir_all(&dir);
+    let tmp = common::tempdir();
+    let dir = tmp.path();
     for i in 0..60 {
         let leaf = dir.join(format!("d{i}"));
         std::fs::create_dir_all(&leaf).expect("create temp tree");
@@ -452,11 +446,43 @@ fn an_arbitrary_commands_flags_are_not_rtks_to_read() {
         assert!(
             mine.text.starts_with("[ok]"),
             "rtk {sub} du -h <tree> did not produce RTK's own summary; got: {}",
-            &mine.text[..mine.text.len().min(120)]
+            mine.text.chars().take(120).collect::<String>()
         );
     }
 
-    let _ = std::fs::remove_dir_all(&dir);
+    // `rtk test` reports the tail of what it ran rather than a copy of it.
+    let mine = run_rtk(&["test", "du", "-h", &tree]);
+    assert_ne!(
+        mine.text, raw.text,
+        "rtk test du -h <tree> passed du's output through instead of filtering it"
+    );
+    assert!(
+        mine.text.starts_with("OUTPUT (last 5 lines):"),
+        "rtk test du -h <tree> did not produce RTK's own report; got: {}",
+        mine.text.chars().take(120).collect::<String>()
+    );
+}
+
+/// `rtk git log` probes git again with the patch letters stripped from the caller's flags,
+/// which turns `-hp` into a bare `-h`. The command has already gone to git, so git's answer,
+/// usage or rejection, is the only one, with git's own code.
+#[test]
+fn a_clustered_h_is_answered_by_git_once() {
+    let Some(git) = on_path("git") else {
+        eprintln!("skipped: git not installed");
+        return;
+    };
+    let repo = common::temp_git_repo();
+    let flags = ["log", "-hp"];
+    let mut rtk_cmd = common::rtk_command();
+    rtk_cmd.current_dir(repo.path()).arg("git");
+    let mine = finish(rtk_cmd, &flags, "rtk");
+    let mut git_cmd = Command::new(&git);
+    common::isolate_git(&mut git_cmd);
+    git_cmd.current_dir(repo.path());
+    let theirs = finish(git_cmd, &flags, "git");
+    assert_eq!(mine.code, theirs.code, "rtk git log -hp exit code");
+    assert_eq!(mine.text, theirs.text, "rtk git log -hp output");
 }
 
 #[test]
@@ -497,8 +523,8 @@ fn a_usage_request_keeps_a_non_zero_exit() {
 #[cfg(unix)]
 #[test]
 fn a_tools_own_dash_h_is_still_filtered() {
-    let dir = std::env::temp_dir().join("rtk_4198_filtered");
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let tmp = common::tempdir();
+    let dir = tmp.path();
     std::fs::write(dir.join("one.txt"), "x\n").expect("write");
     std::fs::write(dir.join("two.txt"), "y\n").expect("write");
     let path = dir.to_string_lossy().into_owned();
@@ -522,8 +548,6 @@ fn a_tools_own_dash_h_is_still_filtered() {
             args.join(" ")
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// RTK's own commands keep their help: releasing everything would satisfy the checks
