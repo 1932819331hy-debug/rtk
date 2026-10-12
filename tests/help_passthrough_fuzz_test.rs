@@ -12,7 +12,7 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn on_path(tool: &str) -> Option<PathBuf> {
@@ -89,8 +89,13 @@ fn finish(mut cmd: Command, args: &[&str], label: &str) -> Output {
     }
 }
 
-fn run(program: &PathBuf, args: &[&str]) -> Output {
-    finish(Command::new(program), args, &program.display().to_string())
+fn run(program: &Path, args: &[&str]) -> Output {
+    let label = program.display().to_string();
+    let mut cmd = common::native_command(&label);
+    if let Some(dir) = common::rtk_command().get_current_dir() {
+        cmd.current_dir(dir);
+    }
+    finish(cmd, args, &label)
 }
 
 /// rtk with its tracking database and tee spool redirected to this test's scratch
@@ -274,11 +279,7 @@ fn a_wrapped_tools_own_help_survives_rtk() {
         };
         let label = format!("rtk {}", case.rtk_args.join(" "));
         let mine = run_rtk(case.rtk_args);
-        let mut native_cmd = Command::new(&tool);
-        if let Some(dir) = common::rtk_command().get_current_dir() {
-            native_cmd.current_dir(dir);
-        }
-        let native = finish(native_cmd, case.native_args, &tool.display().to_string());
+        let native = run(&tool, case.native_args);
         checked += 1;
 
         assert!(
@@ -408,7 +409,7 @@ fn go_test_help_is_not_replayed_through_the_injected_json() {
     rtk_cmd.current_dir(&dir).arg("go");
     let mine = finish(rtk_cmd, &args, "rtk");
 
-    let mut go_cmd = Command::new(&go);
+    let mut go_cmd = common::native_command(&go.display().to_string());
     go_cmd.current_dir(&dir);
     let theirs = finish(go_cmd, &args, "go");
 
