@@ -48,6 +48,7 @@ pub struct RunOptions<'a> {
     /// What the tool prints on a clean run in the output format rtk injected, e.g. ruff's
     /// `[]`. See [`guard_stdout`]. Not consulted when `tee_label` is set.
     pub clean_outputs: &'a [&'a str],
+    pub unguarded_help: bool,
 }
 
 impl<'a> RunOptions<'a> {
@@ -56,6 +57,11 @@ impl<'a> RunOptions<'a> {
             tee_label: Some(label),
             ..Default::default()
         }
+    }
+
+    pub fn unguarded_help(mut self) -> Self {
+        self.unguarded_help = true;
+        self
     }
 
     pub fn stdout_only() -> Self {
@@ -272,57 +278,47 @@ fn last_lines_offset(text: &str, n: usize) -> Option<(usize, usize)> {
 
 /// How one tool spells a request for its own usage.
 struct HelpSpelling {
-    /// `-h` asks for help. False where the tool spells something else with it.
     short_h: bool,
-    /// `Msbuild` makes `-flag`, `--flag` and `/flag` one atomic name, which is how dotnet
-    /// reads `-?` and `/?` and how Go reads `-help`. `Posix` clusters short flags instead.
     dialect: Dialect,
-    /// The tool hands everything past `--` to another program, so a request there is still
-    /// a request: `cargo test -- --help` is libtest's usage, where `grep -- --help` is a
-    /// pattern to search for.
     past_boundary: bool,
+    whole_arg: &'static [&'static str],
 }
 
 fn help_spelling(stem: &str, first: Option<&str>) -> HelpSpelling {
-    let short_h = !matches!(stem, "psql" | "ls" | "tree" | "grep");
-    // dotnet is MSBuild-flavoured; Go's flag package takes single-dash long names.
-    let dialect = match stem {
-        "dotnet" | "go" => Dialect::Msbuild,
-        _ => Dialect::Posix,
-    };
-    // `npx [--no-install] -- <tool>` is how utils::tool_exec reaches a tool that is not on
-    // PATH, so for npx the boundary is always RTK's own rather than the caller's. bunx needs
-    // no entry: it takes the tool as a plain positional.
-    let past_boundary = stem == "npx"
-        || matches!(
-            (stem, first.unwrap_or_default()),
-            ("cargo", "test" | "bench" | "run" | "nextest")
-                | ("go", "test" | "run")
-                | ("uv", "run")
-                | ("deno", "run" | "test")
-                | ("npm" | "pnpm" | "yarn" | "bun", "run" | "exec" | "test")
-        );
     HelpSpelling {
-        short_h,
-        dialect,
-        past_boundary,
+        short_h: !matches!(stem, "psql" | "ls" | "tree" | "grep"),
+        dialect: if stem == "dotnet" {
+            Dialect::Msbuild
+        } else {
+            Dialect::Posix
+        },
+        past_boundary: stem == "npx"
+            || matches!(
+                (stem, first.unwrap_or_default()),
+                ("cargo", "test" | "bench" | "run" | "nextest")
+                    | ("go", "test" | "run")
+                    | ("uv", "run")
+                    | ("npm" | "pnpm" | "yarn" | "bun", "run" | "exec" | "test")
+            ),
+        whole_arg: if stem == "go" { &["-help"] } else { &[] },
     }
 }
 
-/// True when this invocation asks the tool for its own usage or version banner.
-///
-/// A filter reads a usage page as an empty run, and `guard::never_worse` does not catch it
-/// because the summary is the smaller of the two (#4198).
 fn asks_for_usage(stem: &str, args: &[String]) -> bool {
     let first = args.first().map(String::as_str);
     let spelling = help_spelling(stem, first);
-    // `cargo install <crate> --version 1.2.3` names a version to install, not a request.
     let takes_value = |kind: TokenKind, name: &str| {
-        (stem == "cargo"
+        let cargo_install_version = stem == "cargo"
             && first == Some("install")
             && kind == TokenKind::Long
-            && name == "version")
-            .then(ValueSpec::value)
+            && name == "version";
+        let git_message = stem == "git"
+            && match kind {
+                TokenKind::Short => matches!(name, "m" | "F"),
+                TokenKind::Long => matches!(name, "message" | "file"),
+                _ => false,
+            };
+        (cargo_install_version || git_message).then(ValueSpec::value)
     };
     let tokens = arg_tokenizer::tokenize_grammar(args, &takes_value, spelling.dialect);
     if names_usage(arg_tokenizer::before_dashdash(&tokens), args, &spelling) {
@@ -331,9 +327,6 @@ fn asks_for_usage(stem: &str, args: &[String]) -> bool {
     if !spelling.past_boundary {
         return false;
     }
-    // Past the boundary the tokenizer stops classifying, because for most tools that region
-    // is operands. For one that forwards it, it is another program's argv and gets its own
-    // scan: `cargo test -- --help` is libtest's usage, `pnpm exec -- tsc --help` is tsc's.
     let Some(boundary) = tokens
         .iter()
         .find(|t| t.kind == TokenKind::DashDash)
@@ -350,6 +343,7 @@ fn asks_for_usage(stem: &str, args: &[String]) -> bool {
             short_h: true,
             dialect: Dialect::Posix,
             past_boundary: false,
+            whole_arg: &[],
         },
     )
 }
@@ -359,22 +353,19 @@ fn names_usage(
     args: &[String],
     spelling: &HelpSpelling,
 ) -> bool {
-    tokens.iter().any(|t| match t.kind {
-        // A flag carrying a value is naming something, not asking.
-        TokenKind::Long => {
-            (matches!(t.text, "help" | "version" | "?") || (spelling.short_h && t.text == "h"))
-                && t.attached.is_none()
-                && t.linked.is_none()
+    tokens.iter().any(|t| {
+        let arg = args.get(t.source_index).map(String::as_str);
+        if spelling.whole_arg.iter().any(|w| arg == Some(*w)) {
+            return true;
         }
-        // Only when `-h` is the whole argument. Inside a cluster that `h` is almost never
-        // the flag: `find -maxdepth 2` and `mvn -Dhttp.proxyHost=p` both carry one, and
-        // reading them as a request runs the command unfiltered.
-        TokenKind::Short => {
-            spelling.short_h
-                && t.text == "h"
-                && args.get(t.source_index).map(String::as_str) == Some("-h")
+        match t.kind {
+            TokenKind::Long => {
+                (matches!(t.text, "help" | "version" | "?") || (spelling.short_h && t.text == "h"))
+                    && t.linked.is_none()
+            }
+            TokenKind::Short => spelling.short_h && t.text == "h" && arg == Some("-h"),
+            _ => false,
         }
-        _ => false,
     })
 }
 
@@ -408,7 +399,7 @@ pub fn run(
     mode: RunMode<'_>,
     opts: RunOptions<'_>,
 ) -> Result<i32> {
-    let mode = if requests_help(&cmd) {
+    let mode = if !opts.unguarded_help && requests_help(&cmd) {
         RunMode::Passthrough
     } else {
         mode
@@ -666,7 +657,7 @@ pub fn run_err_cmd(
         tool,
         display,
         Box::new(ErrorStreamFilter::new()),
-        RunOptions::with_tee(tee_label),
+        RunOptions::with_tee(tee_label).unguarded_help(),
     )
 }
 
@@ -784,6 +775,7 @@ pub fn run_test_cmd(
     tee_label: &str,
     eco: TestEcosystem,
     verbose: u8,
+    caller_named_command: bool,
 ) -> Result<i32> {
     if verbose > 0 {
         eprintln!("Running tests: {}", display);
@@ -793,7 +785,11 @@ pub fn run_test_cmd(
         tool,
         display,
         move |raw| extract_test_summary(raw, eco),
-        RunOptions::with_tee(tee_label),
+        if caller_named_command {
+            RunOptions::with_tee(tee_label).unguarded_help()
+        } else {
+            RunOptions::with_tee(tee_label)
+        },
     )
 }
 
@@ -1509,10 +1505,6 @@ mod requests_help_tests {
         assert!(checked > 500, "fuzz did not cover enough, got {checked}");
     }
 
-    /// Shapes that have made argument scanners panic: nothing, a bare boundary, repeated
-    /// boundaries, a lone dash, empty strings and non-UTF8.
-    /// A tool that forwards past `--` is handing another program its argv, so a request
-    /// there is still a request. For one that does not, the same tokens are operands.
     #[test]
     fn a_forwarded_boundary_is_another_programs_argv() {
         // `cargo test -- --help` is libtest's usage; an integration case for it would
@@ -1531,7 +1523,7 @@ mod requests_help_tests {
 
     /// A flag that carries a value is naming something, not asking for usage.
     #[test]
-    fn a_value_is_not_a_request() {
+    fn a_separate_value_names_something_an_attached_one_still_asks() {
         assert!(!asks(
             "cargo",
             &["install", "ripgrep", "--version", "1.2.3"]
@@ -1540,9 +1532,13 @@ mod requests_help_tests {
             asks("cargo", &["install", "--version"]),
             "alone it still asks"
         );
-        assert!(!asks("cargo", &["build", "--help=never"]));
+        assert!(asks("cargo", &["build", "--help=never"]));
+        assert!(asks("prettier", &["--help=x"]));
+        assert!(asks("go", &["build", "--help=x"]));
     }
 
+    /// Shapes that have made argument scanners panic: nothing, a bare boundary, repeated
+    /// boundaries, a lone dash, empty strings and non-UTF8.
     #[test]
     fn fuzz_odd_argv_never_panics() {
         const ODD: &[&[&str]] = &[
@@ -1570,6 +1566,24 @@ mod requests_help_tests {
 
     /// The regression this rule exists for: a single-dash long name and a `-D` property
     /// both carry an `h`, and reading either as a request runs the command unfiltered.
+    #[test]
+    fn a_go_value_that_starts_with_a_slash_is_not_a_switch() {
+        assert!(!asks("go", &["test", "-run", "/version"]));
+        assert!(!asks("go", &["test", "-run", "/help", "./..."]));
+        assert!(!asks("go", &["build", "-o", "/tmp/help"]));
+        assert!(asks("go", &["vet", "-help"]));
+        assert!(asks("go", &["test", "-h"]));
+        assert!(asks("dotnet", &["build", "/?"]));
+    }
+
+    #[test]
+    fn deno_hands_the_forwarded_region_to_the_test_scripts() {
+        assert!(!asks("deno", &["test", "--", "--help"]));
+        assert!(!asks("deno", &["run", "x.ts", "--", "--help"]));
+        assert!(asks("deno", &["test", "--help"]));
+        assert!(asks("deno", &["--version"]));
+    }
+
     #[test]
     fn a_letter_inside_another_flag_is_not_a_request() {
         assert!(!asks("find", &["src", "-maxdepth", "2", "-name", "mod.rs"]));

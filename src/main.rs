@@ -4585,7 +4585,16 @@ mod tests {
         assert_eq!(filtered(true, &["--help"]), vec!["-A", "--help"]);
         assert_eq!(filtered(false, &["-h"]), vec!["-h"]);
 
-        // Anything else runs as the caller typed it, which is what kubectl answers itself.
+        match build_k8s_namespace_args("pods", None, false, owned(&["--", "--help"])) {
+            K8sAlias::Raw(argv) => assert_eq!(
+                argv.iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                vec!["pods", "--", "--help"]
+            ),
+            K8sAlias::Filtered(args) => panic!("expected a raw run, got {args:?}"),
+        }
+
         match build_k8s_namespace_args("pods", None, true, owned(&["-o", "wide"])) {
             K8sAlias::Raw(argv) => assert_eq!(
                 argv.iter()

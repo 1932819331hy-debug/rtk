@@ -716,14 +716,10 @@ pub fn exec_capture(cmd: &mut Command) -> Result<CaptureResult> {
 /// Like [`exec_capture`] but inherits stdin so a wrapped engine can read a piped stdin.
 pub fn exec_capture_stdin(cmd: &mut Command) -> Result<CaptureResult> {
     cmd.stdin(Stdio::inherit());
-    show_usage_if_asked(cmd)?;
     capture(cmd)
 }
 
-/// For a command RTK issues on its own behalf rather than one the caller typed: a version
-/// probe asks `--version` to read the answer, not to show it, so the usage guard below must
-/// not fire. Everything a caller's argv reaches goes through [`exec_capture`] instead.
-pub fn exec_capture_probe(cmd: &mut Command) -> Result<CaptureResult> {
+pub fn exec_capture_unguarded(cmd: &mut Command) -> Result<CaptureResult> {
     cmd.stdin(Stdio::null());
     capture(cmd)
 }

@@ -38,8 +38,8 @@ pub fn run_restore(args: &[String], verbose: u8) -> Result<i32> {
 
 pub fn run_format(args: &[String], verbose: u8) -> Result<i32> {
     let args = &args_utils::restore_double_dash(args);
-    if crate::core::runner::requests_help_args("dotnet", args) {
-        return run_passthrough(&forwarded_dotnet_args("format", args), verbose);
+    if let Some(forwarded) = help_forward("format", args) {
+        return run_passthrough(&forwarded, verbose);
     }
     let tokens = tokenize_dotnet_args(args);
     let timer = tracking::TimedExecution::start();
@@ -82,6 +82,11 @@ pub fn run_format(args: &[String], verbose: u8) -> Result<i32> {
 
 /// The subcommand RTK routed on, then the caller's own arguments: what the child would
 /// have seen without the binlog injection.
+fn help_forward(subcommand: &str, args: &[String]) -> Option<Vec<OsString>> {
+    crate::core::runner::requests_help_args("dotnet", args)
+        .then(|| forwarded_dotnet_args(subcommand, args))
+}
+
 fn forwarded_dotnet_args(subcommand: &str, args: &[String]) -> Vec<OsString> {
     let mut out = vec![OsString::from(subcommand)];
     out.extend(args.iter().map(OsString::from));
@@ -130,8 +135,8 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
     // Forwarded clean rather than left to the guard in stream::capture: by then RTK has
     // injected `-bl:<tmp>.binlog`, and an injected flag can change what a tool prints for
     // help -- git's `--no-pager` turns its man page into a one-screen usage (#4198).
-    if crate::core::runner::requests_help_args("dotnet", args) {
-        return run_passthrough(&forwarded_dotnet_args(subcommand, args), verbose);
+    if let Some(forwarded) = help_forward(subcommand, args) {
+        return run_passthrough(&forwarded, verbose);
     }
     let tokens = tokenize_dotnet_args(args);
     let timer = tracking::TimedExecution::start();
@@ -1486,6 +1491,29 @@ fn format_restore_output(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dotnet_routes_a_usage_request_to_the_unfiltered_path() {
+        let owned = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let route = |sub: &str, a: &[&str]| {
+            super::help_forward(sub, &owned(a)).map(|v| {
+                v.iter()
+                    .map(|o| o.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            route("build", &["--help"]),
+            Some(vec!["build".into(), "--help".into()])
+        );
+        assert_eq!(
+            route("format", &["-?"]),
+            Some(vec!["format".into(), "-?".into()])
+        );
+        assert_eq!(route("test", &["/?"]).map(|v| v.len()), Some(2));
+        assert_eq!(route("build", &["-c", "Release"]), None);
+        assert_eq!(route("test", &[]), None);
+    }
+
     use super::*;
 
     /// dotnet is not installed on every runner, so the argv the help guard forwards is

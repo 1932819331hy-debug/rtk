@@ -226,6 +226,7 @@ pub fn run_test(args: &[String], verbose: u8) -> Result<i32> {
         "bun_test",
         crate::core::runner::TestEcosystem::Bun,
         verbose,
+        false,
     )
 }
 

@@ -8,7 +8,7 @@ use crate::core::guard::never_worse;
 use crate::core::runner::{self, RunOptions};
 use crate::core::stream::{
     self, CaptureResult, FilterMode, LineHandler, LineStreamFilter, StdinMode, exec_capture,
-    exec_capture_stdin,
+    exec_capture_stdin, exec_capture_unguarded,
 };
 use crate::core::tracking;
 use crate::core::truncate::{CAP_LIST, CAP_WARNINGS};
@@ -1028,7 +1028,7 @@ fn commit_or_stat_route(args: &[String]) -> ShowRoute {
 fn probe_is_blob(global_args: &[String], arg: &str) -> bool {
     let mut cmd = git_cmd(global_args);
     cmd.args(["cat-file", "-t", arg]);
-    match exec_capture(&mut cmd) {
+    match exec_capture_unguarded(&mut cmd) {
         Ok(result) if result.success() => result.stdout.trim() == "blob",
         _ => false,
     }
@@ -1674,7 +1674,7 @@ fn walk_exceeds_limit(
     }
     cmd.args(log_probe_args(args, tokens));
 
-    let result = exec_capture(&mut cmd).ok()?;
+    let result = exec_capture_unguarded(&mut cmd).ok()?;
     if !result.success() {
         return None;
     }

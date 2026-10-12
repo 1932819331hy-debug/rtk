@@ -274,7 +274,11 @@ fn a_wrapped_tools_own_help_survives_rtk() {
         };
         let label = format!("rtk {}", case.rtk_args.join(" "));
         let mine = run_rtk(case.rtk_args);
-        let native = run(&tool, case.native_args);
+        let mut native_cmd = Command::new(&tool);
+        if let Some(dir) = common::rtk_command().get_current_dir() {
+            native_cmd.current_dir(dir);
+        }
+        let native = finish(native_cmd, case.native_args, &tool.display().to_string());
         checked += 1;
 
         assert!(
@@ -295,6 +299,12 @@ fn a_wrapped_tools_own_help_survives_rtk() {
             without_exe(&mine.text).contains(&anchor),
             "{label} does not contain the tool's own first line {anchor:?}:\n{}",
             &mine.text[..mine.text.len().min(200)]
+        );
+        assert!(
+            mine.text.len() * 2 >= native.text.len(),
+            "{label} returned {} bytes of the tool's {}",
+            mine.text.len(),
+            native.text.len()
         );
     }
 
@@ -345,6 +355,119 @@ fn grep_dash_h_searches_and_drops_the_filename() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_caller_value_that_spells_a_help_token_is_not_a_request() {
+    let dir = std::env::temp_dir().join("rtk_4198_values");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let file = dir.join("flags.txt");
+    std::fs::write(&file, "use --help for usage\nplain\nuse --version here\n").expect("write");
+    let f = file.to_string_lossy().into_owned();
+
+    for (tool, args) in [
+        ("grep", vec!["-e", "--help", &f]),
+        ("grep", vec!["--", "--version", &f]),
+        ("grep", vec!["-F", "--", "--help", &f]),
+        ("rg", vec!["-e", "--help", &f]),
+        ("rg", vec!["--", "-h", &f]),
+    ] {
+        let Some(native) = on_path(tool) else {
+            continue;
+        };
+        let mine = run_rtk(&[&[tool], args.as_slice()].concat());
+        let theirs = run(&native, &args);
+        assert_eq!(
+            mine.text,
+            theirs.text,
+            "rtk {tool} {} searched for the token instead of matching it",
+            args.join(" ")
+        );
+        assert_eq!(mine.code, theirs.code, "{tool} {}", args.join(" "));
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn go_test_help_is_not_replayed_through_the_injected_json() {
+    let Some(go) = on_path("go") else { return };
+    let dir = std::env::temp_dir().join("rtk_4198_gomod");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    std::fs::write(dir.join("go.mod"), "module t\n\ngo 1.21\n").expect("write go.mod");
+    std::fs::write(
+        dir.join("t_test.go"),
+        "package t\n\nimport \"testing\"\n\nfunc TestA(t *testing.T) {}\n",
+    )
+    .expect("write test");
+
+    let args = ["test", "./...", "-args", "-help"];
+    let mut rtk_cmd = common::rtk_command();
+    rtk_cmd.current_dir(&dir).arg("go");
+    let mine = finish(rtk_cmd, &args, "rtk");
+
+    let mut go_cmd = Command::new(&go);
+    go_cmd.current_dir(&dir);
+    let theirs = finish(go_cmd, &args, "go");
+
+    assert!(
+        !mine.text.contains("\"Action\":"),
+        "the usage came back as -json events:\n{}",
+        &mine.text[..mine.text.len().min(200)]
+    );
+    assert!(
+        mine.text.contains("Usage of") && theirs.text.contains("Usage of"),
+        "expected the test binary's usage from both sides"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_arbitrary_commands_flags_are_not_rtks_to_read() {
+    let Some(df) = on_path("df") else { return };
+    let raw = run(&df, &["-h"]);
+    for sub in ["err", "summary"] {
+        let mine = run_rtk(&[sub, "df", "-h"]);
+        assert!(
+            mine.text.len() * 2 < raw.text.len(),
+            "rtk {sub} df -h returned {} bytes of df's {}, so it was not filtered",
+            mine.text.len(),
+            raw.text.len()
+        );
+    }
+}
+
+#[test]
+fn a_usage_request_keeps_a_non_zero_exit() {
+    let mut checked = 0usize;
+    for (tool, args) in [
+        ("wget", vec!["--zzz", "--help"]),
+        ("pnpm", vec!["outdated", "--zzz", "--help"]),
+    ] {
+        let Some(native) = on_path(tool) else {
+            continue;
+        };
+        let theirs = run(&native, &args);
+        if theirs.code == 0 {
+            continue;
+        }
+        let mine = run_rtk(&[&[tool], args.as_slice()].concat());
+        assert_eq!(
+            mine.code,
+            theirs.code,
+            "rtk {tool} {} must end with the tool's code",
+            args.join(" ")
+        );
+        assert!(!is_rtk_usage(&mine.text));
+        checked += 1;
+    }
+    if checked == 0 {
+        eprintln!("skipped: no tool available that rejects a flag before printing usage");
+    }
 }
 
 /// The inverse of the passthrough: a tool whose `-h` is its own flag must still be
