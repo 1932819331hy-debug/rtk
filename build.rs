@@ -14,14 +14,17 @@ use std::path::Path;
 /// skip the flag), and the flag syntax itself — `link.exe` takes `/STACK:`
 /// while the MinGW `ld` behind `x86_64-pc-windows-gnu` only understands
 /// `--stack`, and feeding it `/STACK:` makes it look for a file by that name.
+/// Only `msvc` needs its own spelling: `gnu` (gnullvm reports it too) links
+/// through a gcc or clang driver that takes `-Wl,--stack`, and that is also what
+/// an environment the match does not name gets.
 fn set_windows_stack_size() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
     const STACK_BYTES: usize = 8 * 1024 * 1024;
     let arg = match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
-        Ok("gnu") => format!("-Wl,--stack,{STACK_BYTES}"),
-        _ => format!("/STACK:{STACK_BYTES}"),
+        Ok("msvc") => format!("/STACK:{STACK_BYTES}"),
+        _ => format!("-Wl,--stack,{STACK_BYTES}"),
     };
     println!("cargo:rustc-link-arg={arg}");
 }
