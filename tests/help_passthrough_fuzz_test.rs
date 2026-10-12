@@ -429,20 +429,34 @@ fn go_test_help_is_not_replayed_through_the_injected_json() {
 #[cfg(unix)]
 #[test]
 fn an_arbitrary_commands_flags_are_not_rtks_to_read() {
-    let Some(df) = on_path("df") else { return };
-    let raw = run(&df, &["-h"]);
+    let Some(du) = on_path("du") else { return };
+
+    // Generated rather than `df -h`, whose 436 bytes on a CI runner are small enough that
+    // RTK rightly returns them raw and the marker below cannot tell guard from size.
+    let dir = std::env::temp_dir().join("rtk_4198_dutree");
+    let _ = std::fs::remove_dir_all(&dir);
+    for i in 0..60 {
+        let leaf = dir.join(format!("d{i}"));
+        std::fs::create_dir_all(&leaf).expect("create temp tree");
+        std::fs::write(leaf.join("f"), vec![b'x'; 2000]).expect("write leaf");
+    }
+    let tree = dir.display().to_string();
+
+    let raw = run(&du, &["-h", &tree]);
     for sub in ["err", "summary"] {
-        let mine = run_rtk(&[sub, "df", "-h"]);
+        let mine = run_rtk(&[sub, "du", "-h", &tree]);
         assert_ne!(
             mine.text, raw.text,
-            "rtk {sub} df -h passed df's output through instead of filtering it"
+            "rtk {sub} du -h <tree> passed du's output through instead of filtering it"
         );
         assert!(
             mine.text.starts_with("[ok]"),
-            "rtk {sub} df -h did not produce RTK's own summary; got: {}",
+            "rtk {sub} du -h <tree> did not produce RTK's own summary; got: {}",
             &mine.text[..mine.text.len().min(120)]
         );
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
