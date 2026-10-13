@@ -35,7 +35,85 @@ pub(crate) enum HookDecision {
     /// Say nothing; let the host handle the command untouched.
     Defer,
     /// A deny rule matched — stay out of the way of the host's native deny.
-    Deny,
+    ///
+    /// `reason` is set only when a `hook.before_tool.shell` rule stopped the
+    /// command and supplied text to show. A host that can carry a reason
+    /// surfaces it; the rest render the variant exactly as they always have.
+    Deny { reason: Option<String> },
+}
+
+/// The pipeline's answer for a shell command, as a [`HookDecision`].
+///
+/// `None` means the pipeline had nothing to say and the normal permission and
+/// rewrite path should run — which is every case for a build without the
+/// engine, where [`before_shell_decision`](crate::core::pipeline_config::before_shell_decision)
+/// is the shim that always answers `Rewrite`.
+fn pipeline_shell_gate(cmd: &str) -> Option<HookDecision> {
+    let (decision, rule, action) =
+        map_shell_decision(crate::core::pipeline_config::before_shell_decision(cmd))?;
+    log_pipeline_decision(cmd, &rule, action);
+    Some(decision)
+}
+
+/// The pipeline verdict as a [`HookDecision`], plus what to log. Split from the
+/// lookup so the mapping is testable without a pipeline file on disk — the same
+/// reason [`decide_with_params`] takes its parameters.
+fn map_shell_decision(
+    verdict: crate::core::pipeline_config::ShellHookDecision,
+) -> Option<(HookDecision, String, &'static str)> {
+    use crate::core::pipeline_config::ShellHookDecision;
+    Some(match verdict {
+        ShellHookDecision::Rewrite => return None,
+        ShellHookDecision::Deny { message, rule } => (
+            HookDecision::Deny {
+                reason: Some(message),
+            },
+            rule,
+            "deny",
+        ),
+        ShellHookDecision::Route { message, rule } => (
+            HookDecision::Deny {
+                reason: Some(message),
+            },
+            rule,
+            "route",
+        ),
+        ShellHookDecision::Swap { command, rule } => {
+            (HookDecision::AskRewrite(command), rule, "swap")
+        }
+        ShellHookDecision::Answer { message, rule } => (
+            HookDecision::Deny {
+                reason: Some(message),
+            },
+            rule,
+            "answer",
+        ),
+        ShellHookDecision::Passthrough { rule } => (HookDecision::Defer, rule, "passthrough"),
+        ShellHookDecision::NoRewrite => (HookDecision::Defer, String::new(), "passthrough"),
+    })
+}
+
+#[cfg(not(feature = "engine"))]
+fn log_pipeline_decision(_cmd: &str, _rule: &str, _action: &str) {}
+
+#[cfg(feature = "engine")]
+fn log_pipeline_decision(cmd: &str, rule: &str, action: &str) {
+    use crate::core::pipeline_log;
+    if !pipeline_log::enabled() {
+        return;
+    }
+    pipeline_log::append(&pipeline_log::LogEntry {
+        ts: pipeline_log::now_ts(),
+        session: super::hook_session(),
+        site: "hook".to_string(),
+        event: "before_tool".to_string(),
+        subject: "shell".to_string(),
+        tool: Some("shell".to_string()),
+        command: Some(cmd.to_string()),
+        rule: rule.to_string(),
+        action: Some(action.to_string()),
+        ..pipeline_log::LogEntry::default()
+    });
 }
 
 /// The environment variable a delegate sets to say which agent it speaks for.
@@ -142,6 +220,17 @@ impl ApprovalOwner {
 /// An identity rewrite (`cmd` was already RTK-prefixed) is reported here as a
 /// normal rewrite. Callers that want it suppressed apply [`suppress_identity`].
 pub(crate) fn decide(cmd: &str, verdict: PermissionVerdict) -> HookDecision {
+    if verdict == PermissionVerdict::Deny {
+        return HookDecision::Deny { reason: None };
+    }
+    if let Some(decided) = pipeline_shell_gate(cmd) {
+        return match decided {
+            HookDecision::AskRewrite(swapped) if verdict == PermissionVerdict::Allow => {
+                HookDecision::AllowRewrite(swapped)
+            }
+            other => other,
+        };
+    }
     let (excluded, transparent_prefixes) = crate::core::config::hook_rewrite_params();
     decide_with_params(cmd, verdict, &excluded, &transparent_prefixes)
 }
@@ -161,7 +250,7 @@ pub(crate) fn decide_with_params(
     transparent_prefixes: &[String],
 ) -> HookDecision {
     if verdict == PermissionVerdict::Deny {
-        return HookDecision::Deny;
+        return HookDecision::Deny { reason: None };
     }
 
     if verdict == PermissionVerdict::Defer {
@@ -385,7 +474,7 @@ mod tests {
     fn deny_wins_before_anything_else() {
         assert_eq!(
             decide_with_params("git status", PermissionVerdict::Deny, &[], &[]),
-            HookDecision::Deny
+            HookDecision::Deny { reason: None }
         );
     }
 
@@ -476,8 +565,8 @@ mod tests {
     #[test]
     fn suppress_identity_passes_deny_and_defer_through() {
         assert_eq!(
-            suppress_identity("x", HookDecision::Deny),
-            HookDecision::Deny
+            suppress_identity("x", HookDecision::Deny { reason: None }),
+            HookDecision::Deny { reason: None }
         );
         assert_eq!(
             suppress_identity("x", HookDecision::Defer),
@@ -583,6 +672,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_pipeline_deny_becomes_a_deny_carrying_its_reason() {
+        use crate::core::pipeline_config::ShellHookDecision;
+        let (decision, rule, action) = map_shell_decision(ShellHookDecision::Deny {
+            message: "blocked by policy".to_string(),
+            rule: "no-curl".to_string(),
+        })
+        .expect("deny is a pipeline verdict");
+        assert_eq!(
+            decision,
+            HookDecision::Deny {
+                reason: Some("blocked by policy".to_string())
+            }
+        );
+        assert_eq!((rule.as_str(), action), ("no-curl", "deny"));
+    }
+
+    #[test]
+    fn a_pipeline_route_also_stops_the_command_with_its_message() {
+        use crate::core::pipeline_config::ShellHookDecision;
+        let (decision, _, action) = map_shell_decision(ShellHookDecision::Route {
+            message: "use `rtk git log` instead".to_string(),
+            rule: "prefer-rtk".to_string(),
+        })
+        .expect("route is a pipeline verdict");
+        assert_eq!(
+            decision,
+            HookDecision::Deny {
+                reason: Some("use `rtk git log` instead".to_string())
+            }
+        );
+        assert_eq!(action, "route");
+    }
+
+    #[test]
+    fn a_pipeline_passthrough_defers_so_the_host_runs_it_untouched() {
+        use crate::core::pipeline_config::ShellHookDecision;
+        let (decision, rule, action) = map_shell_decision(ShellHookDecision::Passthrough {
+            rule: "leave-alone".to_string(),
+        })
+        .expect("passthrough is a pipeline verdict");
+        assert_eq!(decision, HookDecision::Defer);
+        assert_eq!((rule.as_str(), action), ("leave-alone", "passthrough"));
+    }
+
+    #[test]
+    fn no_rewrite_defers_without_naming_a_rule() {
+        use crate::core::pipeline_config::ShellHookDecision;
+        let (decision, rule, _) =
+            map_shell_decision(ShellHookDecision::NoRewrite).expect("a pipeline verdict");
+        assert_eq!(decision, HookDecision::Defer);
+        assert!(rule.is_empty());
+    }
+
+    #[test]
+    fn rewrite_yields_to_the_permission_and_rewrite_path() {
+        use crate::core::pipeline_config::ShellHookDecision;
+        assert!(map_shell_decision(ShellHookDecision::Rewrite).is_none());
+    }
+
+    #[test]
+    fn a_denied_verdict_still_wins_over_any_pipeline_rule() {
+        assert_eq!(
+            decide("anything", PermissionVerdict::Deny),
+            HookDecision::Deny { reason: None }
+        );
+    }
     /// The load-bearing property of [`ApprovalOwner`]: it relaxes the
     /// *default* ask and touches nothing else. A deny reaching `AllowRewrite`
     /// would auto-apply a command the user forbade, so it is asserted directly
@@ -606,8 +762,11 @@ mod tests {
             HookDecision::AskRewrite(rewritten())
         );
         assert_eq!(
-            ApprovalOwner::Delegate.apply(HookDecision::Deny, PermissionVerdict::Default),
-            HookDecision::Deny
+            ApprovalOwner::Delegate.apply(
+                HookDecision::Deny { reason: None },
+                PermissionVerdict::Default
+            ),
+            HookDecision::Deny { reason: None }
         );
         assert_eq!(
             ApprovalOwner::Delegate.apply(HookDecision::Defer, PermissionVerdict::Default),
@@ -635,13 +794,15 @@ mod tests {
                 PermissionVerdict::Allow,
                 HookDecision::AllowRewrite("rtk git status".to_string()),
             ),
-            (PermissionVerdict::Deny, HookDecision::Deny),
+            (PermissionVerdict::Deny, HookDecision::Deny { reason: None }),
             (PermissionVerdict::Default, HookDecision::Defer),
         ] {
             let expected = match &decision {
                 HookDecision::AskRewrite(r) => HookDecision::AskRewrite(r.clone()),
                 HookDecision::AllowRewrite(r) => HookDecision::AllowRewrite(r.clone()),
-                HookDecision::Deny => HookDecision::Deny,
+                HookDecision::Deny { reason } => HookDecision::Deny {
+                    reason: reason.clone(),
+                },
                 HookDecision::Defer => HookDecision::Defer,
             };
             assert_eq!(ApprovalOwner::Rtk.apply(decision, verdict), expected);

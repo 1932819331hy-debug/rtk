@@ -16,18 +16,43 @@ use crate::core::user_dirs;
 use crate::core::user_env;
 use crate::core::utils::strip_leading_bom;
 
+/// Ceiling for a `before_tool` payload, which carries a command string.
 const STDIN_CAP: usize = 1_048_576; // 1 MiB
 
-fn read_stdin_limited() -> Result<String> {
-    let mut input = String::new();
+/// Ceiling for an `after_tool` payload, which embeds the whole tool result: a
+/// file read, a `grep -r` dump, full bash output. One `Read` of a 1 MB file
+/// crosses the before-tool cap, so sharing it would refuse to process
+/// exactly the outputs worth compressing. Matches the proxy's body ceiling.
+const STDIN_CAP_AFTER_TOOL: usize = 64 * 1_048_576; // 64 MiB
+
+/// Read a hook payload, capped at `limit`.
+///
+/// `Ok(None)` means "over the cap" — the caller emits nothing and exits 0. A
+/// hook must never fail a tool call: `CONTRIBUTING.md` requires exit 0 on
+/// every error path so the agent's command runs unmodified, and an oversize
+/// payload is not an adversarial input. Bytes that are not valid UTF-8 are
+/// converted lossily for the same reason: a hard error here would exit 1
+/// before the fail-open path could engage, breaking the exit-0 contract.
+fn read_stdin_capped(limit: usize) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
     io::stdin()
-        .take((STDIN_CAP + 1) as u64)
-        .read_to_string(&mut input)
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)
         .context("Failed to read stdin")?;
-    if input.len() > STDIN_CAP {
-        anyhow::bail!("hook stdin exceeds {} byte limit", STDIN_CAP);
+    Ok(capped_lossy(bytes, limit))
+}
+
+fn capped_lossy(bytes: Vec<u8>, limit: usize) -> Option<String> {
+    if bytes.len() > limit {
+        return None;
     }
-    Ok(input)
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Read a before-tool payload. `None` = over the cap; the caller must emit
+/// nothing and return `Ok(())` so the agent's command runs unmodified.
+fn read_stdin_limited() -> Result<Option<String>> {
+    read_stdin_capped(STDIN_CAP)
 }
 
 // ── Copilot hook (VS Code + Copilot CLI) ──────────────────────
@@ -64,7 +89,10 @@ enum HookFormat {
 /// Run the Copilot preToolUse hook.
 /// Auto-detects VS Code Copilot Chat vs Copilot CLI format.
 pub fn run_copilot() -> Result<()> {
-    let input = read_stdin_limited()?;
+    super::set_hook_agent("copilot-cli");
+    let Some(input) = read_stdin_limited()? else {
+        return Ok(());
+    };
 
     // Strip leading BOM(s) before trimming: some Windows hosts prepend UTF-8
     // BOMs to hook stdin (confirmed for Cursor), which serde_json rejects.
@@ -80,6 +108,16 @@ pub fn run_copilot() -> Result<()> {
             return Ok(());
         }
     };
+
+    if let Some(name) = v.get("tool_name").and_then(|t| t.as_str())
+        && emit_tool_gate(
+            "copilot-cli",
+            name,
+            v.get("tool_input").unwrap_or(&Value::Null),
+        )
+    {
+        return Ok(());
+    }
 
     match detect_format(&v) {
         HookFormat::VsCode { command } => handle_vscode(&command, &v),
@@ -235,10 +273,106 @@ fn heal_legacy_hook_file(path: &std::path::Path) -> bool {
 /// recall bookkeeping the hook path performs for any command it does not deny.
 fn decide_from_verdict(cmd: &str, verdict: PermissionVerdict) -> HookDecision {
     if verdict == PermissionVerdict::Deny {
-        return HookDecision::Deny;
+        return HookDecision::Deny { reason: None };
     }
     crate::hooks::rewrite_cmd::track_tee_read(cmd);
     decision::decide_for_agent(cmd, verdict)
+}
+
+/// The `{"decision":"deny","reason":...}` shape Gemini and Vibe both answer
+/// with. A pipeline rule's own message replaces the generic text when it has
+/// one, so the user reads why the command stopped instead of guessing.
+fn gemini_deny(reason: Option<&str>) -> String {
+    json!({
+        "decision": "deny",
+        "reason": reason.unwrap_or("Blocked by RTK permission rule"),
+    })
+    .to_string()
+}
+
+/// Render a non-shell pipeline stop in `agent`'s own response shape, or stay
+/// silent when the pipeline only asked to leave the call alone.
+///
+/// Returns true when the processor should stop: the pipeline has spoken and the
+/// tool must not be rewritten.
+/// `None` = the pipeline said nothing, carry on. `Some(None)` = stop silently.
+/// `Some(Some(body))` = stop and say this, in `agent`'s own response shape.
+fn tool_gate_response(agent: &str, tool_name: &str, input: &Value) -> Option<Option<String>> {
+    let decision = pipeline_tool_gate(agent, tool_name, input)?;
+    let HookDecision::Deny {
+        reason: Some(reason),
+    } = decision
+    else {
+        // Defer: the rule said leave it alone, so say nothing at all.
+        return Some(None);
+    };
+    audit_log("skip:pipeline_stop", tool_name, "");
+    Some(Some(match agent {
+        "gemini" | "vibe" => gemini_deny(Some(&reason)),
+        "cursor" => json!({ "permission": "deny", "user_message": reason }).to_string(),
+        _ => json!({
+            "hookSpecificOutput": {
+                "hookEventName": PRE_TOOL_USE_KEY,
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        })
+        .to_string(),
+    }))
+}
+
+/// [`tool_gate_response`] for the processors that write their own stdout.
+/// Returns true when the processor should stop.
+fn emit_tool_gate(agent: &str, tool_name: &str, input: &Value) -> bool {
+    let Some(body) = tool_gate_response(agent, tool_name, input) else {
+        return false;
+    };
+    if let Some(body) = body {
+        let _ = writeln!(io::stdout(), "{body}");
+    }
+    true
+}
+
+/// The pipeline's answer for a non-shell tool call, as a [`HookDecision`].
+///
+/// Shell is already decided inside [`decision::decide`], on the path every hook
+/// shares. This covers the other subjects, which need the agent's own tool name
+/// resolved to a category first — `Read` on Claude Code, `view` on Copilot,
+/// `view_file` on Antigravity all mean the same rule.
+///
+/// `None` means the pipeline said nothing and the call proceeds untouched,
+/// which is every case for a build with no engine or no pipeline file.
+#[cfg(feature = "engine")]
+fn pipeline_tool_gate(agent: &str, tool_name: &str, input: &Value) -> Option<HookDecision> {
+    use crate::core::pipeline_config::{ShellHookDecision, before_tool_decision, subject_facts};
+    use rtk_engine::block::Subject;
+
+    let subject = rtk_engine::harness::profile(agent)?.map_tool(tool_name);
+    // Shell is decided in `decision::decide`; read has its own evaluator, whose
+    // facts are read from disk before the tool runs.
+    if matches!(subject, Subject::Shell | Subject::Read) {
+        return None;
+    }
+    let facts = subject_facts(subject, tool_name, input);
+    match before_tool_decision(subject, &facts) {
+        ShellHookDecision::Deny { message, rule }
+        | ShellHookDecision::Route { message, rule }
+        | ShellHookDecision::Answer { message, rule } => {
+            audit_log("skip:pipeline_stop", tool_name, &rule);
+            Some(HookDecision::Deny {
+                reason: Some(message),
+            })
+        }
+        ShellHookDecision::Passthrough { .. } | ShellHookDecision::NoRewrite => {
+            Some(HookDecision::Defer)
+        }
+        ShellHookDecision::Rewrite | ShellHookDecision::Swap { .. } => None,
+    }
+}
+
+#[cfg(not(feature = "engine"))]
+fn pipeline_tool_gate(_agent: &str, _tool_name: &str, _input: &Value) -> Option<HookDecision> {
+    None
 }
 
 fn decide_hook_action(cmd: &str, host: permissions::Host) -> HookDecision {
@@ -274,7 +408,7 @@ fn vscode_response_from_decision(
     input: &Value,
 ) -> Option<Value> {
     let (rewritten, allow) = match decision {
-        HookDecision::Deny => {
+        HookDecision::Deny { .. } => {
             audit_log("deny", cmd, "");
             return None;
         }
@@ -311,9 +445,9 @@ fn handle_copilot_ide(cmd: &str) -> Result<()> {
 fn copilot_ide_response_from_decision(decision: HookDecision, cmd: &str) -> Option<Value> {
     let reason = match decision {
         HookDecision::Defer => return None,
-        HookDecision::Deny => {
+        HookDecision::Deny { reason } => {
             audit_log("deny", cmd, "");
-            "Blocked by RTK permission rule".to_string()
+            reason.unwrap_or_else(|| "Blocked by RTK permission rule".to_string())
         }
         HookDecision::AllowRewrite(rewritten) | HookDecision::AskRewrite(rewritten) => {
             audit_log("rewrite", cmd, &rewritten);
@@ -341,7 +475,7 @@ fn copilot_cli_response_from_decision(
     cmd: &str,
 ) -> Option<Value> {
     let (rewritten, allow) = match decision {
-        HookDecision::Deny => {
+        HookDecision::Deny { .. } => {
             audit_log("deny", cmd, "");
             return None;
         }
@@ -371,7 +505,10 @@ fn copilot_cli_response_from_decision(
 
 /// Run the Gemini CLI BeforeTool hook.
 pub fn run_gemini() -> Result<()> {
-    let input = read_stdin_limited()?;
+    super::set_hook_agent("gemini");
+    let Some(input) = read_stdin_limited()? else {
+        return Ok(());
+    };
     let output = run_gemini_inner(&input).context("Failed to parse hook input as JSON")?;
     let _ = writeln!(io::stdout(), "{output}");
     Ok(())
@@ -415,6 +552,13 @@ fn run_gemini_inner_impl(
     let json: Value = serde_json::from_str(input)?;
 
     let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(body) = tool_gate_response(
+        "gemini",
+        tool_name,
+        json.get("tool_input").unwrap_or(&Value::Null),
+    ) {
+        return Ok(body.unwrap_or_else(|| gemini_json("allow", None)));
+    }
     if tool_name != "run_shell_command" {
         return Ok(gemini_json("allow", None));
     }
@@ -428,9 +572,7 @@ fn run_gemini_inner_impl(
     }
 
     Ok(match decide(cmd) {
-        HookDecision::Deny => {
-            r#"{"decision":"deny","reason":"Blocked by RTK permission rule"}"#.to_string()
-        }
+        HookDecision::Deny { ref reason } => gemini_deny(reason.as_deref()),
         HookDecision::AllowRewrite(ref rewritten) => {
             audit_log("rewrite", cmd, rewritten);
             gemini_json("allow", Some(rewritten))
@@ -456,7 +598,10 @@ fn run_gemini_inner_impl(
 /// Fail-open design: invalid JSON, non-command tools, or unparseable payloads
 /// emit `{"decision": "allow"}` so RTK never blocks agent operations.
 pub fn run_antigravity() -> Result<()> {
-    let input = read_stdin_limited()?;
+    let Some(input) = read_stdin_limited()? else {
+        let _ = writeln!(io::stdout(), "{}", json!({ "decision": "allow" }));
+        return Ok(());
+    };
     let output = run_antigravity_inner(&input);
     let _ = writeln!(io::stdout(), "{output}");
     Ok(())
@@ -494,7 +639,7 @@ fn run_antigravity_inner(input: &str) -> Value {
     }
 
     match decide_hook_action(cmd, permissions::Host::Antigravity) {
-        HookDecision::Deny => json!({
+        HookDecision::Deny { .. } => json!({
             "decision": "deny",
             "reason": "Blocked by RTK permission rule"
         }),
@@ -522,7 +667,10 @@ fn run_antigravity_inner(input: &str) -> Value {
 /// - Rewrite: emit `{"hook_specific_output": {"tool_input": {"command": "..."}}}`.
 /// - Deny: emit `{"decision": "deny", "reason": "..."}`.
 pub fn run_vibe() -> Result<()> {
-    let input = read_stdin_limited()?;
+    super::set_hook_agent("vibe");
+    let Some(input) = read_stdin_limited()? else {
+        return Ok(());
+    };
     if let Some(output) = run_vibe_inner(&input) {
         let _ = writeln!(io::stdout(), "{output}");
     }
@@ -539,6 +687,12 @@ fn run_vibe_inner(input: &str) -> Option<String> {
         }
     };
 
+    if let Some(name) = json.get("tool_name").and_then(|t| t.as_str())
+        && emit_tool_gate("vibe", name, json.get("tool_input").unwrap_or(&Value::Null))
+    {
+        return None;
+    }
+
     let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
     // Vibe's Unified Harness namespaces the shell tool as `file_system.bash`.
     if !matches!(tool_name, "bash" | "file_system.bash") {
@@ -554,9 +708,9 @@ fn run_vibe_inner(input: &str) -> Option<String> {
     }
 
     match decide_hook_action(cmd, permissions::Host::Vibe) {
-        HookDecision::Deny => {
+        HookDecision::Deny { ref reason } => {
             audit_log("deny", cmd, "");
-            Some(r#"{"decision":"deny","reason":"Blocked by RTK permission rule"}"#.to_string())
+            Some(gemini_deny(reason.as_deref()))
         }
         HookDecision::AllowRewrite(ref rewritten) | HookDecision::AskRewrite(ref rewritten) => {
             audit_log("rewrite", cmd, rewritten);
@@ -639,6 +793,13 @@ enum PayloadAction {
         reason: &'static str,
         cmd: String,
     },
+    /// A pipeline rule stopped the command and supplied text to show. Unlike a
+    /// deny rule, which stays silent so the host's own deny speaks, this one
+    /// has something the user needs to read.
+    Stop {
+        cmd: String,
+        message: String,
+    },
     Ignore,
 }
 
@@ -687,7 +848,15 @@ fn process_claude_payload_from_decision(
     decision: HookDecision,
 ) -> PayloadAction {
     let (rewritten, allow) = match decision {
-        HookDecision::Deny => {
+        HookDecision::Deny {
+            reason: Some(message),
+        } => {
+            return PayloadAction::Stop {
+                cmd: cmd.to_string(),
+                message,
+            };
+        }
+        HookDecision::Deny { .. } => {
             return PayloadAction::Skip {
                 decision: HookOutcome::Deny,
                 reason: "skip:deny_rule",
@@ -760,9 +929,74 @@ fn log_hook_decision(v: &Value, cmd: &str, decision: HookOutcome, rewritten: Opt
     }
 }
 
+/// One `before_tool` entry in the opt-in decision log.
+/// Called after the stdout response and the tracking write — the log never
+/// sits in front of the response.
+fn log_pipeline_decision(v: &Value, command: &str, rule: &str, action: &str) {
+    log_pipeline_decision_for(v, "shell", command, rule, action);
+}
+
+#[cfg(not(feature = "engine"))]
+fn log_pipeline_decision_for(
+    _v: &Value,
+    _subject: &str,
+    _target: &str,
+    _rule: &str,
+    _action: &str,
+) {
+}
+
+#[cfg(feature = "engine")]
+fn log_pipeline_decision_for(v: &Value, subject: &str, target: &str, rule: &str, action: &str) {
+    use crate::core::pipeline_log;
+    if !pipeline_log::enabled() {
+        return;
+    }
+    pipeline_log::append(&pipeline_log::LogEntry {
+        ts: pipeline_log::now_ts(),
+        session: v
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .map(str::to_string),
+        site: "hook".to_string(),
+        event: "before_tool".to_string(),
+        subject: subject.to_string(),
+        tool: Some(subject.to_string()),
+        command: Some(target.to_string()),
+        rule: rule.to_string(),
+        action: Some(action.to_string()),
+        ..pipeline_log::LogEntry::default()
+    });
+}
+
+/// The file a read-subject tool call targets, plus whether it asks for the
+/// whole file. `None` for any other tool.
+fn read_tool_target(v: &Value) -> Option<(std::path::PathBuf, bool)> {
+    let tool = v.get("tool_name").and_then(|t| t.as_str())?;
+    if !matches!(tool, "Read" | "NotebookRead") {
+        return None;
+    }
+    let path = v
+        .pointer("/tool_input/file_path")
+        .and_then(|p| p.as_str())?;
+    let ranged = ["offset", "limit"].iter().any(|key| {
+        v.pointer("/tool_input")
+            .and_then(|input| input.get(key))
+            .is_some_and(|value| !value.is_null())
+    });
+    Some((std::path::PathBuf::from(path), !ranged))
+}
+
 /// Run the Claude Code PreToolUse hook natively.
 pub fn run_claude() -> Result<()> {
-    let input = read_stdin_limited()?;
+    super::set_hook_agent("claude-code");
+    // Read at the after-tool ceiling: this one command serves both events, and
+    // which one it is only becomes knowable after parsing. The before-tool cap
+    // is applied below, once the event is known.
+    let Some(input) = read_stdin_capped(STDIN_CAP_AFTER_TOOL)? else {
+        return Ok(());
+    };
+    let raw_len = input.len();
 
     let input = strip_leading_bom(&input).trim();
     if input.is_empty() {
@@ -776,6 +1010,90 @@ pub fn run_claude() -> Result<()> {
             return Ok(());
         }
     };
+
+    super::set_hook_session(
+        v.get("session_id")
+            .and_then(|s| s.as_str())
+            .map(str::to_string),
+    );
+
+    if let Some(purpose) = v
+        .pointer("/tool_input/description")
+        .and_then(|d| d.as_str())
+    {
+        crate::core::pipeline_config::set_call_purpose(purpose);
+    }
+
+    #[cfg(feature = "engine")]
+    crate::core::call_context::set_source(&v);
+
+    match v.get("hook_event_name").and_then(|e| e.as_str()) {
+        #[cfg(feature = "engine")]
+        Some(super::constants::POST_TOOL_USE_KEY) => {
+            super::posthook::run(&v);
+            return Ok(());
+        }
+        // PreToolUse, or absent (older hosts / test payloads): rewrite flow.
+        Some(PRE_TOOL_USE_KEY) | None => {
+            // A before-tool payload carries a command string; anything this
+            // large is not one. Emit nothing rather than fail the call.
+            if raw_len > STDIN_CAP {
+                return Ok(());
+            }
+        }
+        Some(super::constants::SESSION_START_KEY) => {
+            super::session_start::run();
+            return Ok(());
+        }
+        // Unknown event registered against this command: emit nothing.
+        Some(_) => return Ok(()),
+    }
+
+    if let Some((path, whole_file)) = read_tool_target(&v)
+        && let Some(decision) =
+            crate::core::pipeline_config::before_read_decision(&path, whole_file)
+    {
+        let response = json!({
+            "hookSpecificOutput": {
+                "hookEventName": PRE_TOOL_USE_KEY,
+                "permissionDecision": "deny",
+                "permissionDecisionReason": decision.message,
+            }
+        });
+        let target = path.display().to_string();
+        let _ = writeln!(io::stdout(), "{response}");
+        audit_log(
+            &format!("skip:pipeline_{}", decision.action),
+            &target,
+            &decision.rule,
+        );
+        log_pipeline_decision_for(&v, "read", &target, &decision.rule, decision.action);
+        return Ok(());
+    }
+
+    if let Some(name) = v.get("tool_name").and_then(|t| t.as_str())
+        && let Some(decision) = pipeline_tool_gate(
+            "claude-code",
+            name,
+            v.get("tool_input").unwrap_or(&Value::Null),
+        )
+    {
+        if let HookDecision::Deny {
+            reason: Some(message),
+        } = decision
+        {
+            let response = json!({
+                "hookSpecificOutput": {
+                    "hookEventName": PRE_TOOL_USE_KEY,
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": message,
+                }
+            });
+            let _ = writeln!(io::stdout(), "{response}");
+            audit_log("skip:pipeline_stop", name, "");
+        }
+        return Ok(());
+    }
 
     match process_claude_payload(&v) {
         PayloadAction::Rewrite {
@@ -796,6 +1114,7 @@ pub fn run_claude() -> Result<()> {
             let _ = writeln!(io::stdout(), "{output}");
             audit_log("rewrite", &cmd, &rewritten);
             log_hook_decision(&v, &cmd, decision, Some(&rewritten));
+            log_pipeline_decision(&v, &rewritten, "rtk-rewrite", "rewrite");
         }
         PayloadAction::Skip {
             decision,
@@ -812,6 +1131,18 @@ pub fn run_claude() -> Result<()> {
             // what a Bash tool call is waiting on.
             audit_log(reason, &cmd, "");
             log_hook_decision(&v, &cmd, decision, None);
+        }
+        PayloadAction::Stop { cmd, message } => {
+            let response = json!({
+                "hookSpecificOutput": {
+                    "hookEventName": PRE_TOOL_USE_KEY,
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": message,
+                }
+            });
+            let _ = writeln!(io::stdout(), "{response}");
+            audit_log("skip:pipeline_stop", &cmd, "");
+            log_hook_decision(&v, &cmd, HookOutcome::Deny, None);
         }
         PayloadAction::Ignore => {}
     }
@@ -848,7 +1179,7 @@ fn process_trae_payload(v: &Value) -> Option<TraeRewrite> {
         .filter(|command| !command.is_empty())?;
     let rewritten = match decide_hook_action(command, permissions::Host::Trae) {
         HookDecision::AllowRewrite(rewritten) | HookDecision::AskRewrite(rewritten) => rewritten,
-        HookDecision::Deny | HookDecision::Defer => return None,
+        HookDecision::Deny { .. } | HookDecision::Defer => return None,
     };
 
     let mut updated_input = v.get("tool_input")?.clone();
@@ -873,7 +1204,10 @@ fn process_trae_payload(v: &Value) -> Option<TraeRewrite> {
 /// Trae owns the command permission decision. RTK only returns an updated input
 /// when it can safely rewrite a `RunCommand` command.
 pub fn run_trae() -> Result<()> {
-    let input = read_stdin_limited()?;
+    super::set_hook_agent("trae");
+    let Some(input) = read_stdin_limited()? else {
+        return Ok(());
+    };
     let input = strip_leading_bom(&input).trim();
     if input.is_empty() {
         return Ok(());
@@ -886,6 +1220,12 @@ pub fn run_trae() -> Result<()> {
             return Ok(());
         }
     };
+
+    if let Some(name) = v.get("tool_name").and_then(|t| t.as_str())
+        && emit_tool_gate("trae", name, v.get("tool_input").unwrap_or(&Value::Null))
+    {
+        return Ok(());
+    }
 
     if let Some(rewrite) = process_trae_payload(&v) {
         audit_log("rewrite", &rewrite.original, &rewrite.rewritten);
@@ -958,7 +1298,7 @@ fn process_codex_payload_from_decision(
     let (rewritten, outcome) = match decision {
         HookDecision::AllowRewrite(rewritten) => (rewritten, HookOutcome::Allow),
         HookDecision::AskRewrite(rewritten) => (rewritten, HookOutcome::Ask),
-        HookDecision::Deny => {
+        HookDecision::Deny { .. } => {
             return PayloadAction::Skip {
                 decision: HookOutcome::Deny,
                 reason: "skip:deny_rule",
@@ -994,8 +1334,10 @@ fn process_codex_payload_from_decision(
 
 /// Run the Codex CLI PreToolUse hook natively.
 pub fn run_codex() -> Result<()> {
+    super::set_hook_agent("codex");
     let input = match read_stdin_limited() {
-        Ok(input) => input,
+        Ok(Some(input)) => input,
+        Ok(None) => return Ok(()),
         Err(e) => {
             let _ = writeln!(io::stderr(), "[rtk hook] Failed to read JSON input: {e}");
             return Ok(());
@@ -1014,6 +1356,15 @@ pub fn run_codex() -> Result<()> {
         }
     };
 
+    #[cfg(feature = "engine")]
+    crate::core::call_context::set_source(&v);
+
+    if let Some(name) = v.get("tool_name").and_then(|t| t.as_str())
+        && emit_tool_gate("codex", name, v.get("tool_input").unwrap_or(&Value::Null))
+    {
+        return Ok(());
+    }
+
     match process_codex_payload(&v) {
         PayloadAction::Rewrite {
             cmd,
@@ -1025,6 +1376,7 @@ pub fn run_codex() -> Result<()> {
             let _ = writeln!(io::stdout(), "{output}");
         }
         PayloadAction::Skip { cmd, reason, .. } => audit_log(reason, &cmd, ""),
+        PayloadAction::Stop { cmd, .. } => audit_log("skip:pipeline_stop", &cmd, ""),
         PayloadAction::Ignore => {}
     }
 
@@ -1045,7 +1397,10 @@ fn run_codex_inner(input: &str) -> Option<String> {
 
 /// Run the Cursor Agent hook natively.
 pub fn run_cursor() -> Result<()> {
-    let input = read_stdin_limited()?;
+    super::set_hook_agent("cursor");
+    let Some(input) = read_stdin_limited()? else {
+        return Ok(());
+    };
 
     let input = strip_leading_bom(&input).trim();
     if input.is_empty() {
@@ -1060,6 +1415,15 @@ pub fn run_cursor() -> Result<()> {
             return Ok(());
         }
     };
+
+    #[cfg(feature = "engine")]
+    crate::core::call_context::set_source(&v);
+
+    if let Some(name) = v.get("tool_name").and_then(|t| t.as_str())
+        && emit_tool_gate("cursor", name, v.get("tool_input").unwrap_or(&Value::Null))
+    {
+        return Ok(());
+    }
 
     let cmd = match v
         .pointer("/tool_input/command")
@@ -1083,7 +1447,7 @@ pub fn run_cursor() -> Result<()> {
             cursor_ask(&rewritten)
         }
         other => {
-            if matches!(other, HookDecision::Deny) {
+            if matches!(other, HookDecision::Deny { .. }) {
                 audit_log("deny", &cmd, "");
             }
             "{}".to_string()
@@ -1182,7 +1546,7 @@ fn droid_execute_command(v: &Value) -> Option<&str> {
 /// to `rtk …` (updatedInput-without-decision verified on Droid v0.140–0.164).
 fn droid_response_from_decision(v: &Value, cmd: &str, decision: HookDecision) -> Option<Value> {
     let rewritten = match decision {
-        HookDecision::Deny => {
+        HookDecision::Deny { .. } => {
             audit_log("deny", cmd, "");
             return None;
         }
@@ -1227,7 +1591,9 @@ fn opencode_answer_for(cmd: &str, agent: Option<&str>) -> Value {
 /// differs from the verdict for `cmd` as typed, RTK steps aside and returns
 /// `{}`, trading token savings on that command for the user's own policy
 /// (#4195). An allow stays an allow, an ask stays a prompt, and a deny stays
-/// denied — RTK never blocks, lifts or silences anything.
+/// denied — RTK never lifts or silences anything. It blocks only when one of
+/// its own pipeline rules denies or routes the command, answering
+/// `{"block": reason}`.
 fn opencode_answer(cmd: &str, rules: &[permissions_opencode::Rule]) -> Value {
     if cmd.trim().is_empty() {
         return json!({});
@@ -1236,9 +1602,15 @@ fn opencode_answer(cmd: &str, rules: &[permissions_opencode::Rule]) -> Value {
     let rewritten = match decide_from_verdict(cmd, before) {
         // OpenCode denies the typed command itself; a rewrite could only
         // un-match the deny rule.
-        HookDecision::Deny => {
+        HookDecision::Deny { reason: None } => {
             audit_log("deny", cmd, "");
             return json!({});
+        }
+        HookDecision::Deny {
+            reason: Some(reason),
+        } => {
+            audit_log("deny", cmd, "");
+            return json!({ "block": reason });
         }
         HookDecision::Defer => return json!({}),
         HookDecision::AllowRewrite(r) | HookDecision::AskRewrite(r) => r,
@@ -1255,7 +1627,10 @@ fn opencode_answer(cmd: &str, rules: &[permissions_opencode::Rule]) -> Value {
 
 /// Run the Factory Droid PreToolUse hook natively.
 pub fn run_droid() -> Result<()> {
-    let input = read_stdin_limited()?;
+    super::set_hook_agent("droid");
+    let Some(input) = read_stdin_limited()? else {
+        return Ok(());
+    };
 
     let v = match droid_payload(&input) {
         Ok(Some(v)) => v,
@@ -1265,6 +1640,12 @@ pub fn run_droid() -> Result<()> {
             return Ok(());
         }
     };
+
+    if let Some(name) = v.get("tool_name").and_then(|t| t.as_str())
+        && emit_tool_gate("droid", name, v.get("tool_input").unwrap_or(&Value::Null))
+    {
+        return Ok(());
+    }
 
     if let Some(output) = process_droid_payload(&v) {
         let _ = writeln!(io::stdout(), "{output}");
@@ -1300,6 +1681,12 @@ fn run_droid_inner_with_rules(
     allow_rules: &[String],
 ) -> Option<String> {
     let v: Value = droid_payload(input).ok().flatten()?;
+    if let Some(name) = v.get("tool_name").and_then(|t| t.as_str())
+        && let Some(body) =
+            tool_gate_response("droid", name, v.get("tool_input").unwrap_or(&Value::Null))
+    {
+        return body;
+    }
     let cmd = droid_execute_command(&v)?;
     let verdict = permissions::check_command_with_rules(cmd, deny_rules, ask_rules, allow_rules);
     droid_response_from_decision(&v, cmd, decide_from_verdict(cmd, verdict)).map(|o| o.to_string())
@@ -1310,6 +1697,23 @@ mod tests {
     use super::*;
     use crate::core::test_isolation;
     use crate::hooks::permissions::PermissionVerdict;
+
+    #[test]
+    fn capped_lossy_accepts_invalid_utf8_instead_of_failing() {
+        let bytes = vec![0xff, 0xfe, b'{', b'}'];
+        let text = capped_lossy(bytes, 1024).expect("under the cap");
+        assert!(text.contains('\u{FFFD}'));
+        assert!(text.contains("{}"));
+    }
+
+    #[test]
+    fn capped_lossy_enforces_the_cap_and_passes_valid_text() {
+        assert_eq!(capped_lossy(vec![b'a'; 10], 9), None);
+        assert_eq!(
+            capped_lossy(b"{\"a\":1}".to_vec(), 1024).as_deref(),
+            Some("{\"a\":1}")
+        );
+    }
 
     fn rewrite_command_no_prefixes(cmd: &str, excluded: &[String]) -> Option<String> {
         crate::discover::registry::rewrite_command(cmd, excluded, &[])
@@ -1496,7 +1900,7 @@ mod tests {
     fn test_vscode_deny_returns_none() {
         assert!(
             vscode_response_from_decision(
-                HookDecision::Deny,
+                HookDecision::Deny { reason: None },
                 "cargo test",
                 &vscode_input("Bash", "cargo test")
             )
@@ -1558,7 +1962,7 @@ mod tests {
         assert!(
             copilot_cli_response_from_decision(
                 &cli_args("cargo test"),
-                HookDecision::Deny,
+                HookDecision::Deny { reason: None },
                 "cargo test",
             )
             .is_none()
@@ -1617,8 +2021,11 @@ mod tests {
 
     #[test]
     fn test_copilot_ide_permission_deny_is_enforced() {
-        let response =
-            copilot_ide_response_from_decision(HookDecision::Deny, "rm -rf /protected").unwrap();
+        let response = copilot_ide_response_from_decision(
+            HookDecision::Deny { reason: None },
+            "rm -rf /protected",
+        )
+        .unwrap();
         assert_eq!(response["permissionDecision"], "deny");
         assert_eq!(
             response["permissionDecisionReason"],
@@ -1975,7 +2382,11 @@ mod tests {
     #[test]
     fn test_process_claude_payload_decision_deny() {
         let v = claude_input_value("rm -rf /");
-        match process_claude_payload_from_decision(&v, "rm -rf /", HookDecision::Deny) {
+        match process_claude_payload_from_decision(
+            &v,
+            "rm -rf /",
+            HookDecision::Deny { reason: None },
+        ) {
             PayloadAction::Skip { decision, .. } => assert_eq!(decision, HookOutcome::Deny),
             other => {
                 panic!("expected Skip, got a different PayloadAction variant instead: {other:?}")
@@ -2856,7 +3267,7 @@ mod tests {
                 &[],
                 &all_allowed()
             ),
-            HookDecision::Deny
+            HookDecision::Deny { reason: None }
         ));
     }
 
@@ -2897,7 +3308,7 @@ mod tests {
 
     fn gemini_render(cmd: &str, deny: &[String], ask: &[String], allow: &[String]) -> String {
         match decide_with_rules(cmd, deny, ask, allow) {
-            HookDecision::Deny => {
+            HookDecision::Deny { .. } => {
                 r#"{"decision":"deny","reason":"Blocked by RTK permission rule"}"#.to_string()
             }
             HookDecision::AllowRewrite(r) => gemini_json("allow", Some(&r)),
@@ -3158,7 +3569,12 @@ mod tests {
         // in the test environment.
         let v: Value = serde_json::from_str(&droid_input("Execute", "git push --force")).unwrap();
         assert!(
-            droid_response_from_decision(&v, "git push --force", HookDecision::Deny).is_none(),
+            droid_response_from_decision(
+                &v,
+                "git push --force",
+                HookDecision::Deny { reason: None }
+            )
+            .is_none(),
             "deny must step aside (no output), not emit an RTK block"
         );
     }
@@ -3526,5 +3942,52 @@ mod tests {
             v.pointer("/hookSpecificOutput/permissionDecision")
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod read_target_tests {
+    use super::*;
+
+    fn payload(json: &str) -> Value {
+        serde_json::from_str(json).expect("valid payload")
+    }
+
+    #[test]
+    fn a_whole_file_read_is_a_read_target() {
+        let v = payload(r#"{"tool_name":"Read","tool_input":{"file_path":"/a/B.java"}}"#);
+        let (path, whole_file) = read_tool_target(&v).expect("read target");
+        assert_eq!(path.display().to_string(), "/a/B.java");
+        assert!(whole_file);
+    }
+
+    #[test]
+    fn offset_or_limit_makes_the_read_ranged() {
+        for input in [
+            r#"{"tool_name":"Read","tool_input":{"file_path":"/a/B.java","offset":10}}"#,
+            r#"{"tool_name":"Read","tool_input":{"file_path":"/a/B.java","limit":50}}"#,
+        ] {
+            let (_, whole_file) = read_tool_target(&payload(input)).expect("read target");
+            assert!(!whole_file, "{input}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_null_range_is_still_a_whole_file_read() {
+        let v = payload(r#"{"tool_name":"Read","tool_input":{"file_path":"/a/B","offset":null}}"#);
+        let (_, whole_file) = read_tool_target(&v).expect("read target");
+        assert!(whole_file);
+    }
+
+    #[test]
+    fn other_tools_are_not_read_targets() {
+        for input in [
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"/a/B"}}"#,
+            r#"{"tool_name":"Read","tool_input":{}}"#,
+            r#"{"tool_input":{"file_path":"/a/B"}}"#,
+        ] {
+            assert!(read_tool_target(&payload(input)).is_none(), "{input}");
+        }
     }
 }

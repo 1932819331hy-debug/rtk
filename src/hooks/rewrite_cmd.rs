@@ -96,7 +96,7 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
     let verdict = check_command(cmd);
     let decided =
         decision::ApprovalOwner::from_env().apply(decision::decide(cmd, verdict), verdict);
-    if !matches!(decided, HookDecision::Deny) {
+    if !matches!(decided, HookDecision::Deny { .. }) {
         track_tee_read(cmd);
     }
     match decided {
@@ -110,7 +110,13 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
             let _ = std::io::stdout().flush();
             std::process::exit(3);
         }
-        HookDecision::Deny => std::process::exit(2),
+        HookDecision::Deny { reason } => {
+            if let Some(reason) = reason {
+                print!("{reason}");
+                let _ = std::io::stdout().flush();
+            }
+            std::process::exit(2)
+        }
         HookDecision::Defer => std::process::exit(1),
     }
 }
