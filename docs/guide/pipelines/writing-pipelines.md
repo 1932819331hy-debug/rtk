@@ -156,7 +156,8 @@ What a rule may do depends on its position:
 | `hook.before_tool.shell` | — | `rewrite` · `deny` · `passthrough` · `route` | `task` with route; `message` optional |
 | `hook.before_tool.read` | — | `deny` · `passthrough` · `route` | `task` with route; `message` optional |
 | `hook.before_tool.write` | — | `deny` (warned: the body is already generated; a deny only buys a retry) · `passthrough` · `route` | `task` with route |
-| `hook.before_tool.{edit,search,web,subagent,mcp,any}` | — | `deny` · `passthrough` · `route` | `task` with route |
+| `hook.before_tool.edit` | — | `deny` · `passthrough` | |
+| `hook.before_tool.{search,web,subagent,mcp,any}` | — | `deny` · `passthrough` · `route` | `task` with route |
 | `hook.after_tool.{shell,search,web,mcp,subagent,any}` | transform chain | `passthrough` · `route` | `task` with route |
 | `hook.after_tool.read` | transform chain | `passthrough` · `route` (W021: breaks a later Edit) | `task` with route |
 | `hook.after_tool.{write,edit}` | — (no output to extract, W013) | `passthrough` | |
@@ -183,7 +184,7 @@ What each call is handed over as, and the task kind that takes it (a mismatch is
 | `read` | the file path | `summarize` or `digest` |
 | `web` | `-- curl -sL <url>` | `digest` |
 | `search` | `-- rg -n '<pattern>' <path>` | `digest` |
-| `write`, `edit` | `--spec … --reference … --target <file>` | `generate` |
+| `write` | `--spec … --reference … --target <file>` | `generate` |
 | `subagent` | its `description` as the question, over files the agent names | `summarize` |
 | `mcp`, `any` | a question only | a plugin kind |
 

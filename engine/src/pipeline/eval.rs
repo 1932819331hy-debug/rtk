@@ -205,7 +205,7 @@ pub fn interpolate(template: &str, facts: &Facts) -> String {
 }
 
 pub fn route_message(task: &str, facts: &Facts, custom: Option<&str>) -> String {
-    if let Some(custom) = custom {
+    if let Some(custom) = custom.filter(|c| !c.trim().is_empty()) {
         return interpolate(custom, facts);
     }
     if let Some(Fact::Str(command)) = facts.get("command") {
@@ -234,7 +234,7 @@ pub fn route_message(task: &str, facts: &Facts, custom: Option<&str>) -> String 
                 );
             }
         }
-        "write" | "edit" => {
+        "write" => {
             let target = text("file_path").unwrap_or_else(|| "<file>".to_string());
             return format!(
                 "Writing {target} is handled by a worker model. Run: `rtk {task} --spec \"<what the file must do>\" --reference <a similar file> --target {target}`"
@@ -319,15 +319,23 @@ mod tests {
             None,
         );
         assert!(search.contains("-- rg -n 'fn main' src"), "{search}");
+        let write = route_message(
+            "write",
+            &facts_of(&[("tool", "write"), ("file_path", "src/a.rs")]),
+            None,
+        );
+        assert!(
+            write.contains("--target src/a.rs") && write.contains("--spec"),
+            "{write}"
+        );
         let edit = route_message(
             "write",
             &facts_of(&[("tool", "edit"), ("file_path", "src/a.rs")]),
             None,
         );
-        assert!(
-            edit.contains("--target src/a.rs") && edit.contains("--spec"),
-            "{edit}"
-        );
+        assert!(!edit.contains("--target"), "{edit}");
+        let blank = route_message("dg", &facts_of(&[("command", "cargo test")]), Some("  "));
+        assert!(blank.contains("rtk dg"), "{blank}");
         let sub = route_message(
             "explore",
             &facts_of(&[

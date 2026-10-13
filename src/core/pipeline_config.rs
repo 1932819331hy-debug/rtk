@@ -157,10 +157,15 @@ pub fn any_user_pipeline_files() -> bool {
 }
 
 pub fn load() -> LoadedPipeline {
-    load_with_ctx(&ValidateCtx {
+    load_with_ctx(&hook_ctx())
+}
+
+fn hook_ctx() -> ValidateCtx<'static> {
+    ValidateCtx {
         reserved_commands: RESERVED_COMMAND_NAMES,
+        is_reserved_command: Some(is_reserved_command_name),
         ..ValidateCtx::default()
-    })
+    }
 }
 
 pub fn load_with_ctx(ctx: &ValidateCtx) -> LoadedPipeline {
@@ -670,6 +675,7 @@ pub fn before_tool_decision(
                     .def
                     .message
                     .as_deref()
+                    .filter(|m| !m.trim().is_empty())
                     .unwrap_or("blocked by an rtk pipeline rule"),
                 facts,
             ),
@@ -780,6 +786,7 @@ pub fn before_read_decision(path: &std::path::Path, whole_file: bool) -> Option<
                     .def
                     .message
                     .as_deref()
+                    .filter(|m| !m.trim().is_empty())
                     .unwrap_or("blocked by an rtk pipeline rule"),
                 &facts,
             ),
@@ -1012,6 +1019,48 @@ mod tests {
         assert_eq!(loaded.dropped.len(), 1);
         assert!(loaded.dropped[0].ends_with("b.toml"));
         assert!(loaded.diagnostics.iter().any(|d| d.code == Code::W025));
+    }
+
+    #[test]
+    fn the_hook_load_drops_a_task_named_after_a_real_command() {
+        let (_dir, paths) = user_files(&[
+            ("a.toml", GUARD),
+            (
+                "m.toml",
+                "[pipeline]\nname = \"m\"\n\n[task.make]\nkind = \"digest\"\n\n[[hook.before_tool.shell]]\nname = \"to-make\"\nwhen = { command_matches = \"^npm test\" }\naction = \"route\"\ntask = \"make\"\n",
+            ),
+        ]);
+        let loaded = load_from(paths, &hook_ctx());
+        assert!(loaded.diagnostics.iter().any(|d| d.code == Code::E014));
+        assert!(loaded.dropped.iter().any(|p| p.ends_with("m.toml")));
+        let names = rule_names(&loaded);
+        assert!(names.contains(&"no-big".to_string()));
+        assert!(!names.contains(&"to-make".to_string()));
+    }
+
+    #[test]
+    fn a_blank_deny_message_falls_back_to_a_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pipeline.toml"),
+            "[[hook.before_tool.shell]]\nname = \"no-curl\"\nwhen = { command_matches = \"^curl\" }\naction = \"deny\"\nmessage = \"  \"\n",
+        )
+        .expect("write");
+        let root = dir.path().to_str().expect("utf-8 path");
+        let decision = crate::core::user_env::with_vars(
+            &[
+                ("RTK_CONFIG_DIR", Some(root)),
+                ("XDG_DATA_HOME", Some(root)),
+                ("HOME", Some(root)),
+            ],
+            || before_shell_decision("curl x"),
+        );
+        match decision {
+            ShellHookDecision::Deny { message, .. } => {
+                assert_eq!(message, "blocked by an rtk pipeline rule")
+            }
+            _ => panic!("expected a deny"),
+        }
     }
 
     #[test]

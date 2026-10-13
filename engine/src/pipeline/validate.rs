@@ -554,6 +554,12 @@ fn validate_rule(
                 ),
             ));
         }
+        if action == Action::Route && position == Position::hook(Event::BeforeTool, Subject::Edit) {
+            push(Diagnostic::new(
+                Code::E005,
+                "`route` is not legal before an edit — a worker would rewrite the whole file from a spec instead of applying the change; use `deny` or `passthrough`",
+            ));
+        }
         if action == Action::Deny && position == Position::hook(Event::BeforeTool, Subject::Write) {
             push(Diagnostic::new(
                 Code::W004,
@@ -927,7 +933,7 @@ pub fn route_kind_mismatch(position: Position, kind: &str) -> Option<&'static st
             &["summarize", "digest"],
             "a read is handed over as a file path (`summarize` or `digest`)",
         ),
-        (_, Subject::Write | Subject::Edit) => (
+        (_, Subject::Write) => (
             &["generate"],
             "writing a file is delegated with a spec and a target (`generate`)",
         ),
@@ -1412,11 +1418,14 @@ use  = ["term"]
     /// read, write or edit that would break edit-after-read: the agent asked
     /// for the file it is about to modify, and there is no question to answer.
     #[test]
-    fn route_is_legal_at_every_hook_position() {
+    fn route_is_legal_at_every_hook_position_but_before_an_edit() {
         for event in ["before_tool", "after_tool"] {
             for subject in [
                 "read", "write", "edit", "shell", "search", "web", "subagent", "mcp", "any",
             ] {
+                if event == "before_tool" && subject == "edit" {
+                    continue;
+                }
                 let text = format!(
                     "[task.t]\nkind = \"digest\"\n[[hook.{event}.{subject}]]\nname = \"x\"\naction = \"route\"\ntask = \"t\"\n"
                 );
@@ -1471,7 +1480,7 @@ use  = ["term"]
             ("before_tool.shell", "digest"),
             ("before_tool.web", "digest"),
             ("before_tool.read", "summarize"),
-            ("before_tool.edit", "generate"),
+            ("before_tool.write", "generate"),
             ("before_tool.subagent", "summarize"),
             ("after_tool.mcp", "digest"),
         ] {
@@ -1485,6 +1494,18 @@ use  = ["term"]
         ] {
             assert!(routed(pos, kind), "{pos} + {kind} must warn");
         }
+    }
+
+    #[test]
+    fn route_before_an_edit_is_e005() {
+        let rule = |action: &str| {
+            diagnostics_for(&format!(
+                "[task.t]\nkind = \"generate\"\n[[hook.before_tool.edit]]\nname = \"x\"\naction = \"{action}\"\ntask = \"t\"\n"
+            ))
+        };
+        assert!(rule("route").iter().any(|d| d.code == Code::E005));
+        assert!(!rule("deny").iter().any(|d| d.code == Code::E005));
+        assert!(!rule("passthrough").iter().any(|d| d.code == Code::E005));
     }
 
     fn mode_rule(position: &str, kind: &str, extra: &str) -> String {
