@@ -27,7 +27,6 @@
  *   0 + stdout  Rewrite it — OpenClaw's exec policy decides whether it runs
  *   1           No RTK equivalent → pass through unchanged
  *   2           Deny rule matched → block the call
- *   2 + stdout  An rtk pipeline rule blocked it → block, stdout is the reason
  *   3 + stdout  Rewrite it, but require approval — an explicit `ask` rule, or
  *               any ask/default on an rtk that predates RTK_REWRITE_HOST
  *
@@ -76,7 +75,7 @@ type RewriteVerdict = "ask" | "deny";
 
 function tryRewrite(
   command: string
-): [string | null, RewriteVerdict?, string?] {
+): [string | null, RewriteVerdict?] {
   const options = {
     encoding: "utf-8" as const,
     timeout: 2000,
@@ -92,8 +91,7 @@ function tryRewrite(
     // Exit 2 — Deny: command matched a deny rule, block the call. Checked
     // first: a deny outranks every other outcome, on every rtk version.
     if (e?.status === 2) {
-      const reason = e.stdout ? e.stdout.toString().trim() : "";
-      return [null, "deny", reason || undefined];
+      return [null, "deny"];
     }
     // Exit 3 — `Ask`: an explicit `ask` rule the user wrote, or (on an rtk
     // that predates RTK_REWRITE_HOST) any ask/default. Require approval rather
@@ -129,7 +127,7 @@ export default function register(api: any) {
       const command = event.params?.command;
       if (typeof command !== "string") return;
 
-      const [rewritten, verdict, reason] = tryRewrite(command);
+      const [rewritten, verdict] = tryRewrite(command);
 
       // Deny rule matched — block the call entirely
       if (verdict === "deny") {
@@ -138,7 +136,7 @@ export default function register(api: any) {
         }
         return {
           block: true,
-          blockReason: reason ?? "RTK deny rule matched",
+          blockReason: "RTK deny rule matched",
         };
       }
 

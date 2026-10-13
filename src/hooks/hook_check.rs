@@ -104,12 +104,19 @@ fn warning_text(status: HookStatus, suppress_missing: bool) -> Option<&'static s
     }
 }
 
-/// Single source of truth: rate-limits first, then delegates to `status()`.
+/// Single source of truth: delegates to `status()` then rate-limits the warning.
 fn check_and_warn() -> Option<()> {
-    // Marker first: a fresh marker means today's check already ran, so the
-    // common path skips the settings.json parse entirely. The marker is
-    // touched on every completed check (Ok included), not only when a
-    // warning printed -- otherwise healthy setups re-parse on every command.
+    // Probe first so the common HookStatus::Ok path never reads config.toml.
+    // Suppression is consulted only when a missing-hook warning would print.
+    let status = status();
+    if status == HookStatus::Ok {
+        return Some(());
+    }
+    let suppress_missing =
+        status == HookStatus::Missing && crate::core::config::hook_warning_suppressed();
+    let warning = warning_text(status, suppress_missing)?;
+
+    // Rate limit: warn once per day
     let marker = warn_marker_path()?;
     if let Ok(meta) = std::fs::metadata(&marker)
         && let Ok(modified) = meta.modified()
@@ -118,13 +125,9 @@ fn check_and_warn() -> Option<()> {
         return Some(());
     }
 
-    let status = status();
-    let suppress_missing =
-        status == HookStatus::Missing && crate::core::config::hook_warning_suppressed();
-    if let Some(warning) = warning_text(status, suppress_missing) {
-        eprintln!("{}", warning);
-    }
+    eprintln!("{}", warning);
 
+    // Touch marker after warning is printed
     let _ = crate::core::utils::create_private_dir(marker.parent()?);
     let _ = std::fs::write(&marker, b"");
 

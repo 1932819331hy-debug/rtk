@@ -530,6 +530,7 @@ fn health_check(bind: &str) -> bool {
 /// response identifies as rtk-proxy. Public so other hook sites (e.g.
 /// SessionStart) confirm it is *our* daemon rather than any server that
 /// happens to answer TCP on the port.
+#[cfg(feature = "engine")]
 pub fn is_rtk_proxy_at(addr: &str, timeout: Duration) -> bool {
     health_check_with_timeout(addr, timeout)
 }

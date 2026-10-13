@@ -59,10 +59,6 @@ def _pre_tool_call(tool_name=None, args=None, **_kwargs):
             _warn("rtk rewrite timed out")
             return
 
-        blocked = result.stdout.strip() if result.returncode == 2 else ""
-        if blocked:
-            return {"action": "block", "message": blocked}
-
         if result.returncode not in ACCEPTED_REWRITE_RETURN_CODES:
             if result.returncode not in EXPECTED_PASSTHROUGH_RETURN_CODES:
                 details = f"rtk rewrite failed with exit {result.returncode}"

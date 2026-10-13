@@ -3566,7 +3566,7 @@ fn run_cli() -> Result<i32> {
                         println!("{}", rewritten);
                         0
                     }
-                    HookDecision::Deny { .. } => {
+                    HookDecision::Deny => {
                         eprintln!("Denied by a permission rule: {}", raw);
                         1
                     }

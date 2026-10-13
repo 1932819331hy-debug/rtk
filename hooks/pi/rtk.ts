@@ -9,8 +9,6 @@
 // Exit code contract for `rtk rewrite`:
 //   0 + stdout  Rewrite found → mutate command
 //   1           No RTK equivalent → pass through unchanged
-//   2           Permission deny → pass through, the host's own deny applies
-//   2 + stdout  An rtk pipeline rule blocked the command → block, show stdout
 //   3 + stdout  Rewrite (advisory) → mutate command
 
 import type {
@@ -39,22 +37,19 @@ function parseSemver(raw: string): [number, number, number] | null {
   return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)]
 }
 
-type RewriteResult = { rewritten: string } | { blocked: string } | null
-
+// Calls `rtk rewrite`; returns the rewritten command or null (pass through).
 async function rewriteCommand(
   pi: ExtensionAPI,
   cmd: string,
   signal?: AbortSignal
-): Promise<RewriteResult> {
+): Promise<string | null> {
   const result = await pi.exec("rtk", ["rewrite", cmd], {
     timeout: REWRITE_TIMEOUT_MS,
     signal,
   })
   if (result.killed) return null
-  const out = result.stdout.trim()
-  if (result.code === 2 && out) return { blocked: out }
   if (result.code !== 0 && result.code !== 3) return null
-  return out ? { rewritten: out } : null
+  return result.stdout.trim() || null
 }
 
 type StatusContext = {
@@ -128,12 +123,10 @@ export default async function (pi: ExtensionAPI) {
       if (cmd.startsWith("rtk ")) return
       if (process.env.RTK_DISABLED === "1") return
 
-      const result = await rewriteCommand(pi, cmd, ctx.signal)
-      if (result && "blocked" in result) {
-        return { block: true, reason: result.blocked }
-      }
-      if (result && result.rewritten !== cmd) {
-        event.input.command = result.rewritten
+      // Delegate to RTK.
+      const rewritten = await rewriteCommand(pi, cmd, ctx.signal)
+      if (rewritten && rewritten !== cmd) {
+        event.input.command = rewritten
       }
     } catch (err) {
       // Fail open: never block execution on an unexpected error.

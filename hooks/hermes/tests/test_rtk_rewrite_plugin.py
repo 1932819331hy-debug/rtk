@@ -164,7 +164,7 @@ class RtkRewritePluginTest(unittest.TestCase):
         self.assertEqual({"command": "rtk git status"}, args)
 
     def test_expected_passthrough_returncodes_do_not_warn_or_mutate(self):
-        for returncode, stdout in ((1, "rtk git status\n"), (2, "")):
+        for returncode in (1, 2):
             with self.subTest(returncode=returncode):
                 module, callback = self.load_callback()
                 args = {"command": "git status"}
@@ -174,7 +174,7 @@ class RtkRewritePluginTest(unittest.TestCase):
                     "run",
                     return_value=FakeCompletedProcess(
                         returncode=returncode,
-                        stdout=stdout,
+                        stdout="rtk git status\n",
                         stderr="unexpected stderr",
                     ),
                 ):
@@ -183,24 +183,6 @@ class RtkRewritePluginTest(unittest.TestCase):
 
                 self.assertEqual({"command": "git status"}, args)
                 self.assertEqual("", stderr.getvalue())
-
-    def test_pipeline_block_returns_a_block_directive_with_the_reason(self):
-        module, callback = self.load_callback()
-        args = {"command": "rm -r build"}
-
-        with mock.patch.object(
-            module.subprocess,
-            "run",
-            return_value=FakeCompletedProcess(
-                returncode=2, stdout="blocked by an rtk pipeline rule\n"
-            ),
-        ):
-            directive = callback(tool_name="terminal", args=args)
-
-        self.assertEqual(
-            {"action": "block", "message": "blocked by an rtk pipeline rule"}, directive
-        )
-        self.assertEqual({"command": "rm -r build"}, args)
 
     def test_unexpected_returncode_warns_with_stderr_details(self):
         module, callback = self.load_callback()
