@@ -210,25 +210,33 @@ fn real_budget_failure_is_fully_recoverable_and_diagnostics_stay_on_stderr() {
 }
 
 #[test]
-fn tracking_counts_preserved_stderr_and_actual_filtered_stdout() {
+fn tracking_preserves_argv_labels_and_counts_both_streams() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_dir = dir.path().join("data");
     fs::create_dir(&db_dir).expect("create isolated DB directory");
     let db = db_dir.join("history.db");
     let stderr = "▲ [WARNING] preserve every budget diagnostic\n";
-    let out = ng_command(dir.path(), &["build"], TABLE, stderr, 0)
-        .env("RTK_DB_PATH", &db)
-        .output()
-        .expect("run tracked build");
+    let out = ng_command(
+        dir.path(),
+        &["build", "my app", "--output-path", "dist folder"],
+        TABLE,
+        stderr,
+        0,
+    )
+    .env("RTK_DB_PATH", &db)
+    .output()
+    .expect("run tracked build");
     assert!(out.status.success());
     let conn = rusqlite::Connection::open(db).expect("open tracking DB");
-    let (input, output): (usize, usize) = conn
+    let (original, rtk, input, output): (String, String, usize, usize) = conn
         .query_row(
-            "SELECT input_tokens, output_tokens FROM commands ORDER BY id DESC LIMIT 1",
+            "SELECT original_cmd, rtk_cmd, input_tokens, output_tokens FROM commands ORDER BY id DESC LIMIT 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .expect("tracked ng build");
+    assert_eq!(original, "ng build 'my app' --output-path 'dist folder'");
+    assert_eq!(rtk, format!("rtk {original}"));
     assert_eq!(input, (TABLE.len() + stderr.len()).div_ceil(4));
     assert_eq!(output, (out.stdout.len() + out.stderr.len()).div_ceil(4));
 }

@@ -4,6 +4,7 @@ use crate::core::arg_tokenizer::{TokenKind, tokenize};
 use crate::core::args_utils::restore_double_dash;
 use crate::core::guard::never_worse;
 use crate::core::runner;
+use crate::core::shell::display_args;
 use crate::core::stream;
 use crate::core::tracking::TimedExecution;
 use crate::core::utils::{ChildArgExt, resolved_command, strip_ansi};
@@ -34,7 +35,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 fn run_build(args: &[String], verbose: u8) -> Result<i32> {
-    let display = args.join(" ");
+    let display = display_args(args);
     if verbose > 0 {
         eprintln!("Running: ng {display}");
     }
