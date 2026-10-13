@@ -10,15 +10,24 @@ import { delimiter, join } from "node:path"
 // permission rules and answers `{}` whenever the rewrite would change what
 // those rules decide — OpenCode evaluates the final command itself, so a
 // rewrite RTK does return never lifts a deny, silences an ask, or blocks an
-// allow (#4195). To add or change rewrite rules, edit the Rust registry — not
-// this file.
+// allow (#4195). The one block it answers is its own: when an rtk pipeline
+// rule denies or routes the command, the answer is `{"block": reason}` and the
+// call stops with that reason. To add or change rewrite rules, edit the Rust
+// registry — not this file.
 //
 // This file only carries the transport: it must run wherever OpenCode runs, so
 // it uses `node:child_process.execFile` and PATH discovery rather than Bun's
 // `$` shell helper (`TypeError: $ is not a function` under OpenCode Desktop /
 // Electron) and `which` (absent on Windows).
 
-type Answer = { command?: string }
+type Answer = { command?: string; block?: string }
+
+/** An rtk pipeline rule stopped the command; the message says why. */
+export class RtkBlock extends Error {}
+
+function shellQuote(text: string): string {
+  return `'${text.replace(/'/g, `'\\''`)}'`
+}
 
 let cachedRtkPath: string | null = null
 let probedBin: { bin: string; capable: boolean } | null = null
@@ -103,7 +112,8 @@ export function probeRtkHookOpencode(rtkBin: string): Promise<boolean> {
  *
  * The answer is `{}` whenever the rewrite would change the verdict OpenCode's
  * own permission rules give, and that empty answer means the command runs as
- * typed. Anything unusable — non-zero exit, timeout, non-JSON stdout — also
+ * typed. `{"block": reason}` rejects with an `RtkBlock`: an rtk pipeline rule
+ * stopped the command. Anything unusable — non-zero exit, timeout, non-JSON stdout — also
  * resolves to null, so a broken rtk passes the command through instead of
  * blocking the tool call.
  */
@@ -117,7 +127,7 @@ export function runHookOpencode(
   if (agent) argv.push("--agent", agent)
   argv.push(command)
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     execFile(rtkBin, argv, { encoding: "utf8", timeout: timeoutMs, windowsHide: true }, (error, stdout) => {
       if (error) return resolve(null)
 
@@ -127,6 +137,8 @@ export function runHookOpencode(
       } catch {
         return resolve(null)
       }
+
+      if (typeof answer?.block === "string" && answer.block) return reject(new RtkBlock(answer.block))
 
       const rewritten = typeof answer?.command === "string" ? answer.command.trim() : ""
       resolve(rewritten && rewritten !== command ? rewritten : null)
@@ -160,14 +172,24 @@ export async function tryRewriteCommand(
 
   try {
     return await runHookOpencode(rtkBin, command, agent)
-  } catch {
+  } catch (e) {
+    if (e instanceof RtkBlock) throw e
     return null
   }
 }
 
 async function handleToolHook(tool: unknown, container: any, agent?: string) {
   if (!container || typeof container !== "object") return
-  const rewritten = await tryRewriteCommand(String(tool ?? ""), container.command, agent)
+  let rewritten: string | null
+  try {
+    rewritten = await tryRewriteCommand(String(tool ?? ""), container.command, agent)
+  } catch (e) {
+    if (!(e instanceof RtkBlock)) return
+    // Throwing is OpenCode's veto, but a thrown error can be swallowed, so the
+    // command is also replaced by one that prints the reason and fails.
+    container.command = `printf '%s\\n' ${shellQuote(e.message)} >&2; exit 2`
+    throw e
+  }
   if (rewritten) container.command = rewritten
 }
 
