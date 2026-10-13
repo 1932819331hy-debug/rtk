@@ -5,6 +5,27 @@ All notable changes to rtk (Rust Token Killer) will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0](https://github.com/rtk-ai/rtk/compare/v0.52.0...v1.0.0) (2026-10-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cli:** `rtk proxy <cmd>` is now `rtk bypass <cmd>` (the old name stays as an alias), `--ultra-compact` is removed, `rtk gain` excludes oversized outputs from its headline rate, and the default binary's licence changes (an Apache-2.0 edition, rtk-oss, ships alongside). See BREAKING_CHANGES.md.
+
+### Features
+
+* **cli:** pipelines in the CLI, hook gate, rtk llm-proxy ([5d8102a](https://github.com/rtk-ai/rtk/commit/5d8102abf17d6320f3422e11e6f9fd8fc5b8a0c6))
+* **engine:** pipeline engine, plugin and text crates ([62e9047](https://github.com/rtk-ai/rtk/commit/62e9047875f837844d9f3bdeb9782e2f7c70bb9e))
+* **hooks:** agent plugins honour pipeline block and route ([380a804](https://github.com/rtk-ai/rtk/commit/380a804b1f343eddec0710c375066e664aad8b75))
+* **proxy:** rtk-proxy daemon, pipelines at the request layer ([8420c11](https://github.com/rtk-ai/rtk/commit/8420c11fc056f81b8eb064e3410a03a194e7c591))
+
+
+### Bug Fixes
+
+* **hooks:** pipeline hook rules act on Claude Code only; the shared hook core is develop's again ([2b96061](https://github.com/rtk-ai/rtk/commit/2b96061bf6795f5ea22327770fab933c392b0b16))
+* **pipeline:** route before an edit is refused; the hook load rejects tasks named after real commands; a blank message keeps a reason ([45d6ba7](https://github.com/rtk-ai/rtk/commit/45d6ba7fb99bb232c2678b8de0b0565cd5f278ed))
+* **release:** one release and one v-tag for every crate ([e61317a](https://github.com/rtk-ai/rtk/commit/e61317a166111a75ff1d94ee40492c992a9fb8b9))
+
 ## [0.52.0](https://github.com/rtk-ai/rtk/compare/v0.51.0...v0.52.0) (2026-10-13)
 
 
