@@ -312,10 +312,7 @@ fn referenced_plugin_methods(
 
 static SECRET_PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     vec![
-        (
-            "OpenAI-style key",
-            Regex::new(r"sk-[A-Za-z0-9]{20,}").unwrap(),
-        ),
+        ("sk- API key", Regex::new(r"sk-[A-Za-z0-9]{20,}").unwrap()),
         (
             "GitHub token",
             Regex::new(r"gh[pousr]_[A-Za-z0-9]{20,}").unwrap(),
@@ -2369,10 +2366,7 @@ mod tests {
             "key = \"sk-abcdefghijklmnopqrstuvwx\"\npath = \"/Users/alice/secret\"\n".to_string(),
         )];
         let hits = super::scan_for_secrets(&sources);
-        assert!(
-            hits.iter().any(|h| h.contains("OpenAI-style key")),
-            "{hits:?}"
-        );
+        assert!(hits.iter().any(|h| h.contains("sk- API key")), "{hits:?}");
         assert!(
             hits.iter().any(|h| h.contains("absolute home path")),
             "{hits:?}"

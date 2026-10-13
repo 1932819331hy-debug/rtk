@@ -46,7 +46,7 @@ The practical difference: bash output is filtered exactly as in the full edition
 Set `RTK_EDITION=oss` for the install script:
 
 ```bash
-curl -fsSL https://rtk-ai.app/install.sh | RTK_EDITION=oss sh
+curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | RTK_EDITION=oss sh
 ```
 
 Homebrew ships it as a separate formula:

@@ -3,45 +3,12 @@
     ".": {
       "release-type": "rust",
       "package-name": "rtk",
+      "include-component-in-tag": false,
       "bump-minor-pre-major": false,
-      "bump-patch-for-minor-pre-major": false
-    },
-    "engine": {
-      "release-type": "rust",
-      "package-name": "rtk-engine",
-      "bump-minor-pre-major": false,
-      "bump-patch-for-minor-pre-major": false
-    },
-    "proxy": {
-      "release-type": "rust",
-      "package-name": "rtk-proxy",
-      "bump-minor-pre-major": false,
-      "bump-patch-for-minor-pre-major": false
-    },
-    "text": {
-      "release-type": "rust",
-      "package-name": "rtk-text",
-      "bump-minor-pre-major": false,
-      "bump-patch-for-minor-pre-major": false
-    },
-    "plugin": {
-      "release-type": "rust",
-      "package-name": "rtk-plugin",
-      "bump-minor-pre-major": false,
-      "bump-patch-for-minor-pre-major": false
-    }
-  },
-  "plugins": [
-    {
-      "type": "linked-versions",
-      "groupName": "rtk",
-      "components": [
-        "rtk",
-        "rtk-text",
-        "rtk-engine",
-        "rtk-plugin",
-        "rtk-proxy"
+      "bump-patch-for-minor-pre-major": false,
+      "extra-files": [
+        { "type": "toml", "path": "proxy/Cargo.toml", "jsonpath": "$.package.version" }
       ]
     }
-  ]
+  }
 }
