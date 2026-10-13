@@ -60,8 +60,8 @@ claudedocs
 # icm 
 .fastembed_cache/
 
-# Release archives, produced at the repo root by the packaging steps and by
-# scripts/simulate-release.sh. Build output, never committed.
+# Release archives, produced at the repo root by the packaging steps. Build
+# output, never committed.
 /rtk-*.tar.gz
 /rtk-*.zip
 
