@@ -6,7 +6,9 @@
 //! saving.
 
 use crate::core::pipeline_config;
+use crate::core::shell::{Launch, shell_command};
 use crate::core::tracking::{Tracker, estimate_tokens};
+use crate::core::utils::{ChildArgExt, resolved_command};
 use anyhow::{Context, Result, bail};
 use rtk_engine::pipeline::{TaskDef, UpstreamDef};
 use rtk_engine::task::{CorpusFile, TaskIntent, TaskOutcome, WorkerRequest, find_kind};
@@ -150,8 +152,9 @@ fn run_for_output(command: &[String]) -> Result<(CorpusFile, i32)> {
     let (program, rest) = command
         .split_first()
         .context("`--` needs a command after it")?;
-    let output = std::process::Command::new(program)
-        .args(rest)
+    let mut cmd = resolved_command(program);
+    cmd.child_args(rest);
+    let output = cmd
         .output()
         .with_context(|| format!("Failed to run {program}"))?;
     let mut content = String::new();
@@ -322,18 +325,22 @@ fn default_key_env(provider: &str) -> Option<&'static str> {
 /// conventional one when the upstream does not name it.
 fn api_key(upstream: &UpstreamDef) -> Result<String> {
     if let Some(command) = upstream.api_key_command.as_deref() {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
+        let mut cmd = match shell_command(command, None)? {
+            Launch::Ready(cmd) => cmd,
+            Launch::Unrunnable(unrunnable) => {
+                bail!("api_key_command could not be run: {}", unrunnable.message.trim());
+            }
+        };
+        let out = cmd
             .output()
             .with_context(|| format!("running api_key_command: {command}"))?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
-            anyhow::bail!("api_key_command failed: {}", err.trim());
+            bail!("api_key_command failed: {}", err.trim());
         }
         let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if key.is_empty() {
-            anyhow::bail!("api_key_command printed nothing: {command}");
+            bail!("api_key_command printed nothing: {command}");
         }
         return Ok(key);
     }
@@ -754,6 +761,38 @@ mod command_tests {
     fn a_successful_command_reports_zero() {
         let (_, code) = run_for_output(&args(&["sh", "-c", "exit 0"])).expect("runs");
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn api_key_command_resolves_credential_from_stdout() {
+        let upstream = UpstreamDef {
+            api_key_command: Some("echo secret-token-abc".to_string()),
+            ..Default::default()
+        };
+        let key = api_key(&upstream).expect("resolves");
+        assert_eq!(key, "secret-token-abc");
+    }
+
+    #[test]
+    fn api_key_command_nonzero_exit_errors() {
+        let upstream = UpstreamDef {
+            api_key_command: Some("exit 1".to_string()),
+            ..Default::default()
+        };
+        assert!(api_key(&upstream).is_err());
+    }
+
+    #[test]
+    fn api_key_command_empty_output_errors() {
+        #[cfg(unix)]
+        let cmd = "printf ''";
+        #[cfg(windows)]
+        let cmd = "type nul";
+        let upstream = UpstreamDef {
+            api_key_command: Some(cmd.to_string()),
+            ..Default::default()
+        };
+        assert!(api_key(&upstream).is_err());
     }
 }
 
