@@ -490,7 +490,12 @@ fn asks_for_usage(stem: &str, args: &[String]) -> bool {
         (cargo_install_version || git_message).then(ValueSpec::value)
     };
     let tokens = arg_tokenizer::tokenize_grammar(args, &takes_value, spelling.dialect);
-    if names_usage(arg_tokenizer::before_dashdash(&tokens), args, &spelling) {
+    if names_usage(
+        arg_tokenizer::before_dashdash(&tokens),
+        args,
+        &spelling,
+        &takes_value,
+    ) {
         return true;
     }
     if !spelling.past_boundary {
@@ -504,7 +509,8 @@ fn asks_for_usage(stem: &str, args: &[String]) -> bool {
         return false;
     };
     let forwarded = &args[boundary + 1..];
-    let inner = arg_tokenizer::tokenize_grammar(forwarded, &|_, _| None, Dialect::Posix);
+    let no_values = |_: TokenKind, _: &str| None::<ValueSpec>;
+    let inner = arg_tokenizer::tokenize_grammar(forwarded, &no_values, Dialect::Posix);
     names_usage(
         arg_tokenizer::before_dashdash(&inner),
         forwarded,
@@ -514,6 +520,7 @@ fn asks_for_usage(stem: &str, args: &[String]) -> bool {
             past_boundary: false,
             whole_arg: &[],
         },
+        &no_values,
     )
 }
 
@@ -521,6 +528,7 @@ fn names_usage(
     tokens: &[arg_tokenizer::Token<'_>],
     args: &[String],
     spelling: &HelpSpelling,
+    takes_value: &dyn Fn(TokenKind, &str) -> Option<ValueSpec>,
 ) -> bool {
     tokens.iter().any(|t| {
         let arg = args.get(t.source_index).map(String::as_str);
@@ -531,6 +539,8 @@ fn names_usage(
             TokenKind::Long => {
                 (matches!(t.text, "help" | "version" | "?") || (spelling.short_h && t.text == "h"))
                     && t.linked.is_none()
+                    // `--version=1.2.3` on a flag that carries a value names a version too.
+                    && (t.attached.is_none() || takes_value(t.kind, t.text).is_none())
             }
             TokenKind::Short => spelling.short_h && t.text == "h" && arg == Some("-h"),
             _ => false,
@@ -1692,11 +1702,12 @@ mod requests_help_tests {
 
     /// A flag that carries a value is naming something, not asking for usage.
     #[test]
-    fn a_separate_value_names_something_an_attached_one_still_asks() {
+    fn a_flags_value_names_something_a_value_on_help_still_asks() {
         assert!(!asks(
             "cargo",
             &["install", "ripgrep", "--version", "1.2.3"]
         ));
+        assert!(!asks("cargo", &["install", "ripgrep", "--version=1.2.3"]));
         assert!(
             asks("cargo", &["install", "--version"]),
             "alone it still asks"
@@ -1763,6 +1774,20 @@ mod requests_help_tests {
         // Still found when it is the argument.
         assert!(asks("find", &["-h"]));
         assert!(asks("cargo", &["build", "-h"]));
+    }
+
+    /// git's message and file flags carry a value: `git commit -m "--help"` is a message.
+    /// The git handler passes the arguments after the subcommand, as these do, so the rule
+    /// reads `-m` and `-F` this way on every subcommand.
+    #[test]
+    fn a_git_message_is_not_a_request() {
+        assert!(!asks("git", &["-m", "--help"]));
+        assert!(!asks("git", &["-am", "--help"]));
+        assert!(!asks("git", &["-F", "--help"]));
+        assert!(!asks("git", &["--message", "--help"]));
+        assert!(!asks("git", &["--file", "--version"]));
+        assert!(asks("git", &["--help"]));
+        assert!(asks("git", &["-m", "x", "--help"]));
     }
 
     #[test]
