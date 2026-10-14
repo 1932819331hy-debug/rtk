@@ -5,6 +5,16 @@ All notable changes to rtk (Rust Token Killer) will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1](https://github.com/rtk-ai/rtk/compare/v1.0.0...v1.0.1) (2026-10-14)
+
+
+### Bug Fixes
+
+* **gain:** only suggest `rtk pipeline share` where the command exists ([3257b0a](https://github.com/rtk-ai/rtk/commit/3257b0acb37bf9d6a6d8ad78110816bf80caff50))
+* **gain:** only suggest `rtk pipeline share` where the command exists ([2d352df](https://github.com/rtk-ai/rtk/commit/2d352dfcf8f622e7c65f636b09ac1bda7de0a127)), closes [#4557](https://github.com/rtk-ai/rtk/issues/4557)
+* **proxy:** honour RTK_PROXY_BIND in `llm-proxy start` and the agent launchers ([f53e603](https://github.com/rtk-ai/rtk/commit/f53e60337eacf9f300801c4622dc711bd56d8abb))
+* **proxy:** honour RTK_PROXY_BIND in `llm-proxy start` and the agent launchers ([4a583f8](https://github.com/rtk-ai/rtk/commit/4a583f8fa05147bbba28078e03556869c6c396e3)), closes [#4556](https://github.com/rtk-ai/rtk/issues/4556)
+
 ## [1.0.0](https://github.com/rtk-ai/rtk/compare/v0.52.0...v1.0.0) (2026-10-13)
 
 
