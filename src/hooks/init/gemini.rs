@@ -356,7 +356,7 @@ pub fn is_configured() -> bool {
     hook_path.is_file()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "engine"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;
