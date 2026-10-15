@@ -35,7 +35,8 @@ impl Sandbox {
                 .success();
             assert!(ok, "git {args:?} failed");
         }
-        // A tracked change makes `git diff --exit-code` exercise a real failure.
+        // A tracked change, left unstaged: `git diff --exit-code` reports it and
+        // `git diff --cached --exit-code` has nothing to report.
         std::fs::write(root.join("a.txt"), "alpha\nbeta\ngamma\n").expect("modify");
         Sandbox { _dir: dir, root }
     }
@@ -48,7 +49,10 @@ impl Sandbox {
     /// and put the freshly built `rtk` first on PATH so rewritten commands resolve it.
     fn command(&self, program: &str) -> Command {
         let rtk = common::rtk_command();
-        let bin_dir = Path::new(rtk.get_program()).parent().unwrap().to_path_buf();
+        let bin_dir = Path::new(rtk.get_program())
+            .parent()
+            .expect("rtk binary has a parent directory")
+            .to_path_buf();
         let inherited = std::env::var_os("PATH").unwrap_or_default();
         let path =
             std::env::join_paths(std::iter::once(bin_dir).chain(std::env::split_paths(&inherited)))
@@ -88,29 +92,30 @@ impl Sandbox {
     }
 }
 
-fn python3_available() -> bool {
-    Command::new("python3")
+/// Asked in the sandbox's own environment, where the Python cases run: a
+/// version manager's shim can answer for the caller's home and not for it.
+fn python3_available(sb: &Sandbox) -> bool {
+    sb.command("python3")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-/// Each case pairs a recognized tool (the part rtk rewrites) with a failing or
-/// succeeding step, so both the tool's own status and a status flowing through
-/// an `&&` chain are covered.
+/// Each case puts a recognized tool (the part rtk rewrites) alone, succeeding
+/// or failing, or ahead of an `&&`, `||` or `;`, so both its own status and the
+/// list's are checked. The number is the raw command's exit code; `LS_MISSING`
+/// stands for the one a missing operand gets from the `ls` first on PATH.
 const CASES: &[(&str, i32)] = &[
     ("git status", 0),
     ("git log -1 && sh -c 'exit 9'", 9),
     ("git log --no-such-flag", 128),
     ("git diff --exit-code", 1),
     ("git diff --exit-code HEAD && sh -c 'exit 7'", 1),
+    ("git diff --cached --exit-code && sh -c 'exit 7'", 7),
     ("git show no-such-rev && sh -c 'exit 9'", 128),
-    ("ls /nonexistent-rtk-path", missing_ls_exit()),
-    (
-        "ls /nonexistent-rtk-path && sh -c 'exit 13'",
-        missing_ls_exit(),
-    ),
+    ("ls /nonexistent-rtk-path", LS_MISSING),
+    ("ls /nonexistent-rtk-path && sh -c 'exit 13'", LS_MISSING),
     ("ls /nonexistent-rtk-path || sh -c 'exit 13'", 13),
     ("ls a.txt || sh -c 'exit 13'", 0),
     ("ls a.txt && sh -c 'exit 13'", 13),
@@ -124,10 +129,9 @@ const CASES: &[(&str, i32)] = &[
     ("git status; sh -c 'exit 12'", 12),
 ];
 
-// GNU ls returns 2 for a missing operand; BSD ls returns 1.
-const fn missing_ls_exit() -> i32 {
-    if cfg!(target_os = "macos") { 1 } else { 2 }
-}
+/// Replaced by `cases` with the code a missing operand gets from whichever `ls`
+/// is first on PATH: 2 from GNU, 1 from BSD and busybox.
+const LS_MISSING: i32 = -1;
 
 const PYTHON_CASES: &[(&str, i32)] = &[
     // Bare `python3 -c` one-liners are intentional passthrough commands.
@@ -137,19 +141,28 @@ const PYTHON_CASES: &[(&str, i32)] = &[
     ("ls a.txt && python3 -c 'import sys; sys.exit(6)'", 6),
 ];
 
-fn cases() -> Vec<(&'static str, i32)> {
-    let mut all = CASES.to_vec();
-    if python3_available() {
-        all.extend_from_slice(PYTHON_CASES);
-    }
-    all
+fn cases(sb: &Sandbox) -> Vec<(&'static str, i32)> {
+    let probe = sb.sh_exit("ls /nonexistent-rtk-path");
+    let Some(ls_missing @ (1 | 2)) = probe else {
+        panic!("ls on a missing path exited {probe:?}, expected 1 or 2");
+    };
+    let python = if python3_available(sb) {
+        PYTHON_CASES
+    } else {
+        &[]
+    };
+    CASES
+        .iter()
+        .chain(python)
+        .map(|&(case, code)| (case, if code == LS_MISSING { ls_missing } else { code }))
+        .collect()
 }
 
 #[test]
 fn rewritten_commands_keep_the_raw_exit_code() {
     let sb = Sandbox::new();
     let mut mismatches = Vec::new();
-    for (case, expected) in cases() {
+    for (case, expected) in cases(&sb) {
         let rewritten = sb
             .rewrite(case)
             .unwrap_or_else(|| panic!("case must exercise the rewrite path: {case}"));
@@ -171,11 +184,11 @@ fn rewritten_commands_keep_the_raw_exit_code() {
 
 #[test]
 fn every_case_actually_goes_through_a_rewrite() {
-    // Guards the test above: if the rewrite rules drift so that these commands
-    // stop being rewritten, the exit-code check would silently compare `sh`
-    // with itself and keep passing.
+    // The test above stops at the first case that is not rewritten; this one
+    // reports rule drift under its own name. It only asks `rtk rewrite`, which
+    // never runs a case, so it checks the Python rows without python3 too.
     let sb = Sandbox::new();
-    for (case, _) in cases() {
+    for (case, _) in CASES.iter().chain(PYTHON_CASES) {
         assert!(
             sb.rewrite(case).is_some(),
             "case must exercise the rewrite path: {case}"
