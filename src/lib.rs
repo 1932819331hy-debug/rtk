@@ -2477,27 +2477,37 @@ fn require_single_script(subcommand: &str, shell: Option<&str>, command: &[Strin
         .exit();
 }
 
+/// Whether this invocation runs the daily telemetry ping. A parsed
+/// `rtk hook …` command does not: the hook processors run before every
+/// command an agent runs. Anything clap rejects (help, version, a
+/// passthrough command) still runs it.
+fn pings_telemetry(parsed: &Result<Cli, clap::Error>) -> bool {
+    !matches!(
+        parsed,
+        Ok(Cli {
+            command: Commands::Hook { .. },
+            ..
+        })
+    )
+}
+
 fn run_cli() -> Result<i32> {
-    let cli = match try_parse_cli_from(std::env::args_os()) {
+    let parsed = try_parse_cli_from(std::env::args_os());
+
+    // Fire-and-forget telemetry ping (1/day, non-blocking)
+    if pings_telemetry(&parsed) {
+        core::telemetry::maybe_ping();
+    }
+
+    let cli = match parsed {
         Ok(cli) => cli,
         Err(e) => {
-            // Preserve the historical startup telemetry for clap exits and
-            // passthrough commands; only parsed hook commands skip it below.
-            core::telemetry::maybe_ping();
             if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
                 e.exit();
             }
             return run_fallback(e);
         }
     };
-
-    let is_hook_command = matches!(cli.command, Commands::Hook { .. });
-
-    // Hook invocations are latency-sensitive and must not trigger background
-    // telemetry or hook-status I/O themselves.
-    if !is_hook_command {
-        core::telemetry::maybe_ping();
-    }
 
     // Warn if installed hook is outdated/missing (1/day, non-blocking).
     // Skip for Gain (shows its own inline warning), Init/Verify (manage the
@@ -5168,6 +5178,35 @@ mod tests {
                 command: HookCommands::Claude
             }
         ));
+    }
+
+    #[test]
+    fn hook_commands_skip_the_telemetry_ping() {
+        for args in [&["rtk", "hook", "claude"][..], &["rtk", "hook", "codex"]] {
+            assert!(
+                !pings_telemetry(&try_parse_cli_from(args)),
+                "{args:?} must not ping"
+            );
+        }
+    }
+
+    #[test]
+    fn other_invocations_still_run_the_ping() {
+        for args in [
+            &["rtk", "ls"][..],
+            &["rtk", "gain"],
+            &["rtk", "--help"],
+            &["rtk", "--version"],
+            // Rejected by clap: an unknown command runs through the fallback,
+            // and a hook with a bad flag never reaches the hook processor.
+            &["rtk", "uname", "-s"],
+            &["rtk", "hook", "claude", "--bogus"],
+        ] {
+            assert!(
+                pings_telemetry(&try_parse_cli_from(args)),
+                "{args:?} must ping"
+            );
+        }
     }
 
     #[test]
