@@ -2129,33 +2129,21 @@ mod err_test_runner_tests {
         out.lines().filter(|l| l.contains('|')).count()
     }
 
-    /// The same run with its table cut down to `lines`, dropping covered files
-    /// from the end so the structure and the gap row stay where they are.
-    fn trim_coverage_table_to(raw: &str, lines: usize) -> String {
-        let mut kept = 0;
-        let mut in_table = false;
-        let mut out = Vec::new();
-        for line in raw.lines() {
-            let trimmed = line.trim();
-            if BUN_COVERAGE_HEADER.is_match(trimmed) {
-                in_table = true;
-            }
-            if in_table {
-                if trimmed.is_empty() {
-                    in_table = false;
-                } else {
-                    let structural = is_coverage_structure(line);
-                    let last_rule = structural && kept + 1 == lines;
-                    if kept < lines && (!structural || last_rule || kept + 1 < lines) {
-                        kept += 1;
-                        out.push(line);
-                    }
-                    continue;
-                }
-            }
-            out.push(line);
-        }
-        out.join("\n") + "\n"
+    /// The coverage table of a raw bun run, header to closing rule.
+    fn coverage_table_of(raw: &str) -> Vec<&str> {
+        raw.lines()
+            .skip_while(|l| !BUN_COVERAGE_HEADER.is_match(l.trim()))
+            .take_while(|l| !l.trim().is_empty())
+            .collect()
+    }
+
+    /// The table lines of a filtered summary, with the two-space indent the
+    /// summary adds stripped back off, ready to compare with bun's own.
+    fn shown_table_of(out: &str) -> Vec<&str> {
+        out.lines()
+            .filter(|l| l.contains('|'))
+            .map(|l| l.strip_prefix("  ").unwrap_or(l))
+            .collect()
     }
 
     /// `--bail` aborts the run, and bun prints no count lines when it does.
@@ -2188,7 +2176,7 @@ mod err_test_runner_tests {
         // The counts still come through alongside it
         assert!(out.contains("2 fail"), "{out}");
         // A table this small is under the cap, so nothing is announced as dropped.
-        assert!(!out.contains("more coverage rows"), "{out}");
+        assert!(!out.contains("more files"), "{out}");
     }
 
     /// Bun sorts the table by path, so a plain head of it keeps whichever files
@@ -2230,45 +2218,111 @@ mod err_test_runner_tests {
         assert!(out.contains("Ran 41 tests"), "{out}");
     }
 
-    /// A table of exactly the cap is whole, so there is nothing to announce.
+    /// A 16-file project is exactly 20 table lines, which is the cap: the
+    /// table is whole, so there is nothing to announce.
     #[test]
     fn test_bun_coverage_table_at_the_cap_announces_nothing() {
-        let raw = include_str!("../../tests/fixtures/bun_test_coverage_wide_raw.txt");
-        let trimmed = trim_coverage_table_to(raw, MAX_BUN_COVERAGE_ROWS);
-        assert_eq!(coverage_table_lines(&trimmed), MAX_BUN_COVERAGE_ROWS);
+        let raw = include_str!("../../tests/fixtures/bun_test_coverage_at_cap_raw.txt");
+        assert_eq!(coverage_table_lines(raw), MAX_BUN_COVERAGE_ROWS, "fixture");
 
-        let out = extract_test_summary(&trimmed, TestEcosystem::Bun);
-        assert_eq!(shown_table_lines(&out), MAX_BUN_COVERAGE_ROWS, "{out}");
+        let out = extract_test_summary(raw, TestEcosystem::Bun);
+        assert_eq!(shown_table_of(&out), coverage_table_of(raw), "{out}");
         assert!(!out.contains("more files"), "nothing was dropped:\n{out}");
     }
 
-    /// The rows the cap drops are written out, so the hint names a file that
-    /// holds them and nothing else.
+    /// When every row reports a gap there is nothing cheaper to drop, so the
+    /// cap falls back to bun's own order. The structure still comes first:
+    /// both rules and the aggregate are what make the rest readable.
     #[test]
-    fn test_bun_hidden_coverage_rows_are_written_out() {
-        let raw = include_str!("../../tests/fixtures/bun_test_coverage_wide_raw.txt");
+    fn test_bun_coverage_cap_keeps_bun_order_when_every_row_has_a_gap() {
+        let raw = include_str!("../../tests/fixtures/bun_test_coverage_all_partial_raw.txt");
+        let table = coverage_table_of(raw);
+        assert!(table.len() > MAX_BUN_COVERAGE_ROWS, "fixture under the cap");
+
         let out = extract_test_summary(raw, TestEcosystem::Bun);
 
+        // Bun's first 19 lines, then the closing rule it printed last.
+        let mut expected: Vec<&str> = table[..MAX_BUN_COVERAGE_ROWS - 1].to_vec();
+        expected.push(table[table.len() - 1]);
+        assert_eq!(shown_table_of(&out), expected, "{out}");
+
+        assert_eq!(out.matches("more files").count(), 1, "{out}");
+        assert!(
+            out.contains(&format!(
+                "... +{} more files",
+                table.len() - MAX_BUN_COVERAGE_ROWS
+            )),
+            "{out}"
+        );
+    }
+
+    /// Following the hint has to return the dropped rows themselves, all of
+    /// them and in order. Which mode is active decides what the hint names, so
+    /// the test follows whichever one it got.
+    #[test]
+    fn test_bun_hidden_coverage_rows_are_recoverable() {
+        let raw = include_str!("../../tests/fixtures/bun_test_coverage_wide_raw.txt");
+        let table = coverage_table_of(raw);
+
+        // A root of its own: the entry this writes is the one it reads back.
+        let home = crate::core::test_isolation::tempdir();
+        let (out, recovered) = crate::core::test_isolation::with_root(home.path(), || {
+            let out = extract_test_summary(raw, TestEcosystem::Bun);
+            let recovered = follow_recovery_hint(&out);
+            (out, recovered)
+        });
+
+        let shown = shown_table_of(&out);
+        let hidden: Vec<&str> = table
+            .iter()
+            .filter(|l| !shown.contains(*l))
+            .copied()
+            .collect();
+        assert_eq!(
+            hidden.len(),
+            table.len() - MAX_BUN_COVERAGE_ROWS,
+            "the cap dropped something other than what it announced:\n{out}"
+        );
+
+        assert_eq!(
+            recovered.lines().collect::<Vec<_>>(),
+            hidden,
+            "what the hint returns is not the rows that were dropped"
+        );
+    }
+
+    /// Reads back what a recovery hint names, the way a caller following it
+    /// would: the recall entry, or the file the tee branch wrote.
+    fn follow_recovery_hint(out: &str) -> String {
         let hint = out
             .lines()
-            .find(|l| l.contains("tail -n +1 ") || l.contains("rtk recall "))
+            .find(|l| l.contains("rtk recall ") || l.contains("tail -n +1 "))
             .unwrap_or_else(|| panic!("no recovery hint for the hidden rows:\n{out}"));
 
-        if let Some(path) = hint.split("tail -n +1 ").nth(1) {
-            let path = path.trim_end_matches(']').trim();
-            let written = std::fs::read_to_string(path).expect("hinted file");
-            let lines: Vec<&str> = written.lines().collect();
-            assert_eq!(
-                lines.len(),
-                coverage_table_lines(raw) - MAX_BUN_COVERAGE_ROWS,
-                "the file holds exactly the dropped rows"
-            );
-            assert!(lines.iter().any(|l| l.contains("src/f39.ts")), "{written}");
-            assert!(
-                !lines.iter().any(|l| l.contains("src/zeta.ts")),
-                "{written}"
-            );
+        if let Some(rest) = hint.split("rtk recall ").nth(1) {
+            let hash = rest.trim_end_matches(']').trim();
+            return crate::core::retriever::recalled_content(hash)
+                .unwrap_or_else(|| panic!("the hint names recall entry {hash}, which is gone"));
         }
+
+        let rest = hint
+            .split("tail -n +1 ")
+            .nth(1)
+            .unwrap_or_else(|| panic!("unreadable hint: {hint}"));
+        // Tee mode prints the path under `~`, which is the test's own root here.
+        let shown = rest.trim_end_matches(']').trim().trim_matches('"');
+        let path = match shown
+            .strip_prefix("~/")
+            .or_else(|| shown.strip_prefix("$HOME/"))
+        {
+            Some(tail) => crate::core::user_dirs::home()
+                .unwrap_or_else(|| panic!("no home to resolve {shown} against"))
+                .join(tail),
+            None => std::path::PathBuf::from(shown),
+        };
+        std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("the hint names {}, which did not open: {e}", path.display())
+        })
     }
 
     /// A source frame with `||` in it must not read as a table row: that is
