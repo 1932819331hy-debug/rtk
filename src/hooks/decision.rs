@@ -197,10 +197,12 @@ pub(crate) fn decide_for_agent(cmd: &str, verdict: PermissionVerdict) -> HookDec
 /// has rewritten it, and it only accepts git spelled plainly (or under the few
 /// launchers it models). A rewritten `rtk git …` is refused outright as
 /// "cannot be shown not to be git", so no git command could run from an
-/// isolated session (#3864). The payload carries no isolation flag, but the
-/// managed worktrees always live at `<repo>/.claude/worktrees/<name>`, so that
-/// path shape is the signal (see [`in_claude_worktree`]). The rest of a chain
-/// is still rewritten: `git status && cargo build` → `git status && rtk cargo build`.
+/// isolated session (#3864). The payload carries no isolation flag, so the
+/// signal is the path shape Claude Code gives the worktrees it creates,
+/// `<repo>/.claude/worktrees/<name>` (see [`in_claude_worktree`]). A worktree a
+/// `WorktreeCreate` hook places elsewhere is not detected, and git there is
+/// still rewritten. The rest of a chain is still rewritten:
+/// `git status && cargo build` → `git status && rtk cargo build`.
 pub(crate) fn decide_for_agent_at(
     cmd: &str,
     verdict: PermissionVerdict,
@@ -225,7 +227,7 @@ pub(crate) fn in_claude_worktree(cwd: &str) -> bool {
         .collect();
     parts
         .windows(3)
-        .any(|w| w[0] == ".claude" && w[1] == "worktrees")
+        .any(|w| w[0] == super::constants::CLAUDE_DIR && w[1] == "worktrees")
 }
 
 /// Turn a rewrite that changed nothing into a [`HookDecision::Defer`].
@@ -410,6 +412,7 @@ mod tests {
         assert!(!in_claude_worktree("/repo"));
         assert!(!in_claude_worktree("/repo/.claude/worktrees"));
         assert!(!in_claude_worktree("/repo/worktrees/feat-x"));
+        assert!(!in_claude_worktree("/repo/.claude/skills/feat-x"));
     }
 
     #[test]
@@ -424,9 +427,43 @@ mod tests {
             HookDecision::AllowRewrite("git status && rtk cargo build".into())
         );
         assert_eq!(
+            decide_for_agent_at("git log -1 --oneline", PermissionVerdict::Allow, wt),
+            HookDecision::Defer
+        );
+        assert_eq!(
             decide_for_agent_at("git status", PermissionVerdict::Allow, Some("/repo")),
             HookDecision::AllowRewrite("rtk git status".into())
         );
+    }
+
+    /// The worktree exclusion is added to the user's `exclude_commands`, not
+    /// substituted for them.
+    #[test]
+    fn claude_worktree_keeps_the_configured_exclusions() {
+        let tmp = crate::core::test_isolation::tempdir();
+        crate::core::test_isolation::with_root(tmp.path(), || {
+            let config = crate::core::user_dirs::config().expect("a test build has a config dir");
+            std::fs::create_dir_all(&config).expect("create config dir");
+            std::fs::write(
+                config.join(crate::core::constants::CONFIG_TOML),
+                "[hooks]\nexclude_commands = [\"cargo\"]\n",
+            )
+            .expect("write config.toml");
+
+            let wt = Some("/repo/.claude/worktrees/feat-x");
+            assert_eq!(
+                decide_for_agent_at("cargo test", PermissionVerdict::Allow, wt),
+                HookDecision::Defer
+            );
+            assert_eq!(
+                decide_for_agent_at("git status", PermissionVerdict::Allow, wt),
+                HookDecision::Defer
+            );
+            assert_eq!(
+                decide_for_agent_at("ls -la", PermissionVerdict::Allow, wt),
+                HookDecision::AllowRewrite("rtk ls -la".into())
+            );
+        });
     }
 
     /// A rewritable command with no rule matching it is an ask-rewrite, never
