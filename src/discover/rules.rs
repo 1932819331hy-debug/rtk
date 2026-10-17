@@ -695,7 +695,7 @@ pub const RULES: &[RtkRule] = &[
         ..RtkRule::DEFAULT
     },
     RtkRule {
-        pattern: r"^dotnet\s+(build|test|restore|format)\b",
+        pattern: r"^dotnet\s+(build|restore)\b",
         rtk_cmd: "rtk dotnet",
         rewrite_prefixes: &["dotnet"],
         category: "Build",

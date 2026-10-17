@@ -2338,9 +2338,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_dotnet_subcommands() {
-        // All four subcommands have dedicated `rtk dotnet` proxies, so the
-        // rewrite rule must route them.
-        for sub in ["build", "test", "restore", "format"] {
+        for sub in ["build", "restore"] {
             assert_eq!(
                 rewrite_command_no_prefixes(&format!("dotnet {}", sub), &[]),
                 Some(format!("rtk dotnet {}", sub)),
@@ -2350,9 +2348,13 @@ mod tests {
         }
         // Trailing args are preserved (the \b stops at the subcommand).
         assert_eq!(
-            rewrite_command_no_prefixes("dotnet test --filter Category=Unit", &[]),
-            Some("rtk dotnet test --filter Category=Unit".into())
+            rewrite_command_no_prefixes("dotnet restore --force", &[]),
+            Some("rtk dotnet restore --force".into())
         );
+        // `rtk dotnet test` and `rtk dotnet format` change what the native
+        // command does (#4603, #4602), so they are not routed until fixed.
+        assert_eq!(rewrite_command_no_prefixes("dotnet test", &[]), None);
+        assert_eq!(rewrite_command_no_prefixes("dotnet format", &[]), None);
         // Subcommands without a proxy must NOT be rewritten.
         assert_eq!(rewrite_command_no_prefixes("dotnet publish", &[]), None);
         assert_eq!(rewrite_command_no_prefixes("dotnet run", &[]), None);

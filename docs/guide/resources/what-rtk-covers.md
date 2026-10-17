@@ -95,6 +95,7 @@ Every percentage below measures **bash output bytes removed** — the only thing
 | Command | Bash output reduction | What changes |
 |---------|----------------------|--------------|
 | `dotnet build` | 80% | Errors and warnings only |
+| `dotnet restore` | 23-97% | Restore summary, errors and warnings kept |
 | `dotnet test` | 85-90% | Failures only |
 | `dotnet format` | 75% | Changed files only |
 
