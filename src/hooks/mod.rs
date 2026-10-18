@@ -30,6 +30,16 @@ fn is_rtk_binary(binary: &str) -> bool {
 }
 
 fn is_rtk_hook_command(command: &str, agent: &str) -> bool {
+    // Hook ownership must not claim (and uninstall) a user's compound command.
+    // shell_split coalesces adjacent operator tokens into command words, so
+    // check the lexer's typed tokens *before* the argv-style split.
+    if crate::discover::lexer::tokenize_with_newlines(command)
+        .iter()
+        .any(|token| token.kind != crate::discover::lexer::TokenKind::Arg)
+    {
+        return false;
+    }
+
     let parts = crate::discover::lexer::shell_split(command);
     let [parsed_binary, hook, target] = parts.as_slice() else {
         return false;
@@ -68,6 +78,29 @@ mod tests {
         ));
         assert!(is_claude_hook_command(
             "/Users/jane/My\\ Apps/rtk hook claude"
+        ));
+    }
+
+    #[test]
+    fn hook_ownership_rejects_compound_commands_and_redirections() {
+        for operator in [";", "&&", "||", "|", "|&", "&", ">", ">>", "2>"] {
+            let command = format!("my-audit{operator}/usr/local/bin/rtk hook claude");
+            assert!(
+                !is_claude_hook_command(&command),
+                "must not uninstall a user-owned hook with {operator:?}"
+            );
+            let codex = format!("my-audit{operator}/usr/local/bin/rtk hook codex");
+            assert!(
+                !is_rtk_hook_command(&codex, "codex"),
+                "must not claim a user-owned Codex hook with {operator:?}"
+            );
+        }
+        assert!(!is_claude_hook_command(
+            "my-audit\n/usr/local/bin/rtk hook claude"
+        ));
+        assert!(!is_rtk_hook_command(
+            "my-audit\n/usr/local/bin/rtk hook codex",
+            "codex"
         ));
     }
 
