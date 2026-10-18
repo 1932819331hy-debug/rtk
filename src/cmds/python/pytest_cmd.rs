@@ -11,7 +11,6 @@ use std::sync::LazyLock;
 
 const MAX_XFAIL: usize = CAP_WARNINGS;
 const MAX_PYTEST_FAILURES: usize = CAP_WARNINGS;
-// Pytest plugins supply category names; long runs append a timedelta clock.
 static PYTEST_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^(?:=+\s*)?\d+ [^,\r\n=]+?(?:, \d+ [^,\r\n=]+?)* in \d+(?:\.\d+)?(?:s| seconds)(?: \((?:\d+ days?, )?\d+:\d{2}:\d{2}\))?(?:\s*=+)?$",
@@ -102,8 +101,6 @@ pub(crate) fn filter_pytest_output(output: &str) -> String {
     for line in output.lines() {
         let trimmed = line.trim();
 
-        // Accept wrapped and quiet-mode summaries, and keep the last match so
-        // traceback source cannot override pytest's trailing result line.
         // State transitions
         if trimmed.starts_with("===") && trimmed.contains("test session starts") {
             state = ParseState::Header;
