@@ -839,7 +839,36 @@ fn k8s_get_requests_raw_output(args: &[String]) -> bool {
             "-o" | "--output" | "-w" | "--watch" | "--show-labels" | "--show-kind"
         ) || arg.starts_with("-o")
             || arg.starts_with("--output=")
-    })
+    }) || k8s_get_has_named_resource(args)
+}
+
+/// `kubectl get pods NAME` / `get services NAME` returns a single JSON
+/// object, not a List with `items`. Keep kubectl's native output for a
+/// named query rather than claiming that an existing resource was not found.
+/// Consume common option values so `get pods -n default` still uses the
+/// compact list filter; unknown options conservatively pass through.
+fn k8s_get_has_named_resource(args: &[String]) -> bool {
+    let mut idx = 0;
+    while idx < args.len() {
+        let flag = args[idx].as_str();
+        if matches!(
+            flag,
+            "-n" | "--namespace" | "--context" | "--kubeconfig" | "--as"
+                | "-l" | "--selector" | "--field-selector"
+        ) {
+            idx += 2;
+            continue;
+        }
+        if flag == "--" {
+            return idx + 1 < args.len();
+        }
+        if flag.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 pub fn run_kubectl_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
@@ -1020,6 +1049,50 @@ api-1  | Connected to database";
                 Some(("services", &args[1..])),
                 "failed for {resource}"
             );
+        }
+    }
+
+    // #4613: named get returns a Pod/Service JSON object rather than a List.
+    // Never run that result through the list-only `items` formatter.
+    #[test]
+    fn test_k8s_get_named_pod_and_service_pass_through() {
+        for (resource, name) in [
+            ("pods", "web-5dc4d46d9f-hsrcf"),
+            ("po", "web-5dc4d46d9f-hsrcf"),
+            ("services", "api"),
+            ("svc", "api"),
+        ] {
+            let args = vec![resource.to_string(), name.to_string()];
+            assert_eq!(k8s_get_target(&args), None, "{resource} {name}");
+        }
+    }
+
+    #[test]
+    fn test_k8s_named_get_with_namespace_or_context_passes_through() {
+        for args in [
+            vec!["pods", "-n", "production", "web"],
+            vec!["pods", "--namespace", "production", "web"],
+            vec!["services", "--context", "prod", "api"],
+            vec!["pods", "-nproduction", "web"],
+            vec!["pods", "--namespace=production", "web"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            assert_eq!(k8s_get_target(&args), None, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn test_k8s_list_with_option_values_still_filters() {
+        for args in [
+            vec!["pods", "-n", "default"],
+            vec!["services", "--context", "prod"],
+            vec!["pods", "-l", "app=api"],
+            vec!["pods", "--field-selector", "status.phase=Running"],
+            vec!["pods", "--namespace=default"],
+            vec!["pods", "-A"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            assert!(k8s_get_target(&args).is_some(), "{args:?}");
         }
     }
 
