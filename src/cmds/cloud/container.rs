@@ -821,7 +821,9 @@ fn run_k8s_get(tool: &str, args: &[String], verbose: u8) -> Result<i32> {
 fn k8s_get_target(args: &[String]) -> Option<(&'static str, &[String])> {
     let resource = args.first()?.as_str();
     let rest = &args[1..];
-    if k8s_get_requests_raw_output(rest) {
+    if k8s_get_requests_raw_output(rest)
+        || rest.first().is_some_and(|arg| !arg.starts_with('-'))
+    {
         return None;
     }
 
@@ -1019,6 +1021,19 @@ api-1  | Connected to database";
                 k8s_get_target(&args),
                 Some(("services", &args[1..])),
                 "failed for {resource}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_k8s_get_target_named_resources_passthrough() {
+        for resource in ["po", "pod", "pods", "svc", "service", "services"] {
+            let args = vec![resource.to_string(), "named-resource".to_string()];
+
+            assert_eq!(
+                k8s_get_target(&args),
+                None,
+                "named {resource} lookup should use native output"
             );
         }
     }
