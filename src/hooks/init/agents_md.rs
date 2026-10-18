@@ -364,6 +364,17 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_rtk_block_stops_at_first_end_marker() {
+        let after = format!("The closing marker is `{RTK_BLOCK_END}`.\nKeep these notes.");
+        let input = format!("# My rules\n\n{RTK_INSTRUCTIONS}\n\n{after}\n");
+
+        let (cleaned, removed) = remove_rtk_block(&input);
+
+        assert!(removed);
+        assert_eq!(cleaned, format!("# My rules\n\n{after}\n"));
+    }
+
+    #[test]
     fn test_upsert_rtk_block_appends_when_missing() {
         let input = "# Team instructions";
         let (content, action) = upsert_rtk_block(input, RTK_INSTRUCTIONS);
