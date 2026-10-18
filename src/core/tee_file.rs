@@ -150,6 +150,41 @@ fn write_tee_file(
     write_named_tee_file(raw, &filename, dir, max_file_size, max_files)
 }
 
+/// Keep both the command prologue and (most importantly) the final test/build
+/// verdict within the on-disk tee cap. The marker itself counts toward the cap.
+/// Cuts are rounded *inwards* to UTF-8 boundaries. For very small caps there
+/// is not enough room for a marker, so retain a valid UTF-8 suffix instead.
+fn capped_tee_content(raw: &str, cap: usize) -> String {
+    if raw.len() <= cap {
+        return raw.to_owned();
+    }
+    if cap == 0 {
+        return String::new();
+    }
+
+    let marker = format!("\n\n--- middle omitted ({} original bytes) ---\n\n", raw.len());
+    if marker.len() >= cap {
+        let mut start = raw.len() - cap;
+        while !raw.is_char_boundary(start) {
+            start += 1;
+        }
+        return raw[start..].to_owned();
+    }
+
+    let data_budget = cap - marker.len();
+    let mut head_end = data_budget / 4;
+    while !raw.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+
+    let mut tail_start = raw.len() - (data_budget - data_budget / 4);
+    while !raw.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+
+    format!("{}{}{}", &raw[..head_end], marker, &raw[tail_start..])
+}
+
 pub(crate) fn write_named_tee_file(
     raw: &str,
     filename: &str,
@@ -159,21 +194,7 @@ pub(crate) fn write_named_tee_file(
 ) -> Option<PathBuf> {
     create_tee_dir(dir)?;
     let filepath = dir.join(filename);
-    let content = if raw.len() > max_file_size {
-        let boundary = raw
-            .char_indices()
-            .take_while(|(i, _)| *i < max_file_size)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        format!(
-            "{}\n\n--- truncated at {} bytes ---",
-            &raw[..boundary],
-            max_file_size
-        )
-    } else {
-        raw.to_string()
-    };
+    let content = capped_tee_content(raw, max_file_size);
     let mut file = crate::core::utils::open_private(
         std::fs::OpenOptions::new()
             .write(true)
@@ -360,14 +381,21 @@ mod tests {
     }
 
     #[test]
-    fn test_write_tee_file_truncation() {
+    fn test_write_tee_file_truncation_keeps_verdict_within_cap() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let big_output = "x".repeat(2000);
-        let result = write_tee_file(&big_output, "test", tmpdir.path(), 1000, 20);
-        let path = result.expect("tee file written");
+        let output = format!(
+            "build started\n{}MIDDLE_ONLY_CHECKPOINT{}\nFAILED: final verdict\n",
+            "x".repeat(1300),
+            "y".repeat(1300)
+        );
+        let path = write_tee_file(&output, "test", tmpdir.path(), 1000, 20)
+            .expect("tee file written");
         let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains("--- truncated at 1000 bytes ---"));
-        assert!(content.len() < 2000);
+        assert!(content.len() <= 1000, "marker must count toward the cap");
+        assert!(content.starts_with("build started\n"));
+        assert!(content.contains("--- middle omitted ("));
+        assert!(!content.contains("MIDDLE_ONLY_CHECKPOINT"));
+        assert!(content.ends_with("FAILED: final verdict\n"));
     }
 
     #[test]
@@ -375,11 +403,31 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let japanese = "\u{6F22}".repeat(333);
         assert_eq!(japanese.len(), 999);
-        let result = write_tee_file(&japanese, "test_utf8", tmpdir.path(), 998, 20);
-        let path = result.expect("tee file written");
+        let path = write_tee_file(&japanese, "test_utf8", tmpdir.path(), 998, 20)
+            .expect("tee file written");
         let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains("--- truncated at 998 bytes ---"));
-        assert!(content.starts_with(&"\u{6F22}".repeat(332)));
+        assert!(content.len() <= 998);
+        assert!(content.starts_with("\u{6F22}"));
+        assert!(content.ends_with("\u{6F22}"));
+        assert!(content.contains("--- middle omitted ("));
+    }
+
+    #[test]
+    fn test_write_tee_file_tiny_caps_and_multibyte_suffix() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let input = format!("prefix {} verdict: FAIL 🎯\n", "🎯".repeat(30));
+        for cap in [0, 1, 2, 3, 4, 12, 32, 128] {
+            let name = format!("{cap}.log");
+            let path = write_named_tee_file(&input, &name, tmpdir.path(), cap, 20)
+                .expect("tee file written");
+            let written = fs::read_to_string(path).unwrap();
+            assert!(written.len() <= cap, "cap={cap}, bytes={}", written.len());
+            if cap == 0 {
+                assert!(written.is_empty());
+            } else if cap >= 32 {
+                assert!(written.ends_with("verdict: FAIL 🎯\n"));
+            }
+        }
     }
 
     #[test]
