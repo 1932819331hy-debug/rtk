@@ -441,18 +441,45 @@ mod tests {
 
     #[test]
     fn analyze_graph_preserves_large_json_output() {
-        let entries: Vec<_> = (0..200)
-            .map(|i| format!(r#""module_{i}.py": {{"imports": []}}"#))
-            .collect();
-        let raw = format!("{{{}}}", entries.join(","));
+        let raw = include_str!("../../../tests/fixtures/ruff_analyze_graph_raw.json");
         assert!(raw.len() > config::limits().passthrough_max_chars);
 
         let args = ["analyze".to_string(), "graph".to_string()];
-        let result = filter_passthrough_output(&raw, is_analyze_graph_invocation(&args));
+        let result = filter_passthrough_output(raw, is_analyze_graph_invocation(&args));
 
-        assert_eq!(result, raw);
+        assert_eq!(result, raw.trim());
         serde_json::from_str::<serde_json::Value>(&result)
             .expect("analyze graph output must remain valid JSON");
+    }
+
+    /// Only invocations starting `analyze graph` are exempt from the passthrough cap:
+    /// `analyze help graph` and every other passthrough subcommand still get it.
+    #[test]
+    fn only_analyze_graph_skips_the_passthrough_cap() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(is_analyze_graph_invocation(&args(&["analyze", "graph"])));
+        assert!(is_analyze_graph_invocation(&args(&[
+            "analyze",
+            "graph",
+            "--direction",
+            "dependents",
+            "src"
+        ])));
+        assert!(!is_analyze_graph_invocation(&args(&[
+            "analyze", "help", "graph"
+        ])));
+        assert!(!is_analyze_graph_invocation(&args(&["rule", "E501"])));
+
+        let raw = include_str!("../../../tests/fixtures/ruff_rule_e501_raw.txt");
+        assert!(raw.len() > config::limits().passthrough_max_chars);
+        let result =
+            filter_passthrough_output(raw, is_analyze_graph_invocation(&args(&["rule", "E501"])));
+        assert!(
+            result.ends_with("...") && raw.starts_with(result.trim_end_matches("...")),
+            "rule output must be a capped prefix of ruff's, got {} of {} bytes",
+            result.len(),
+            raw.len()
+        );
     }
 
     #[test]
