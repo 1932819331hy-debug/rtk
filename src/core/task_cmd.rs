@@ -328,7 +328,10 @@ fn api_key(upstream: &UpstreamDef) -> Result<String> {
         let mut cmd = match shell_command(command, None)? {
             Launch::Ready(cmd) => cmd,
             Launch::Unrunnable(unrunnable) => {
-                bail!("api_key_command could not be run: {}", unrunnable.message.trim());
+                bail!(
+                    "api_key_command could not be run: {}",
+                    unrunnable.message.trim()
+                );
             }
         };
         let out = cmd
