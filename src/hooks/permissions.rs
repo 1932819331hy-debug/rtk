@@ -566,15 +566,15 @@ mod tests {
     }
 
     fn rules_from_files(files: &[(&str, Option<&str>)]) -> (Vec<String>, Vec<String>, Vec<String>) {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
         let paths: Vec<PathBuf> = files
             .iter()
             .map(|(name, content)| {
                 let path = tmp.path().join(name);
                 match content {
-                    Some(content) => std::fs::write(&path, content).unwrap(),
+                    Some(content) => std::fs::write(&path, content).expect("write settings"),
                     // A directory in place of the file: it exists but cannot be read.
-                    None => std::fs::create_dir(&path).unwrap(),
+                    None => std::fs::create_dir(&path).expect("mkdir settings"),
                 }
                 path
             })
@@ -645,14 +645,36 @@ mod tests {
     }
 
     #[test]
+    fn test_unparseable_settings_file_keeps_other_files_deny_rules() {
+        let (deny, ask, allow) = rules_from_files(&[
+            (
+                "settings.json",
+                Some(r#"{"permissions":{"deny":["Bash(git push *)"],}}"#),
+            ),
+            (
+                "settings.local.json",
+                Some(r#"{"permissions":{"deny":["Bash(rm *)"]}}"#),
+            ),
+        ]);
+        assert_eq!(
+            check_command_with_rules("rm -rf build", &deny, &ask, &allow),
+            PermissionVerdict::Deny
+        );
+        assert_eq!(
+            check_command_with_rules("git push origin main", &deny, &ask, &allow),
+            PermissionVerdict::Ask
+        );
+    }
+
+    #[test]
     fn test_missing_and_empty_settings_files_add_no_rules() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
         let empty = tmp.path().join("settings.local.json");
         std::fs::write(
             &empty, "  
 ",
         )
-        .unwrap();
+        .expect("write settings");
         let (deny, ask, allow) =
             load_permission_rules_from(&[tmp.path().join("settings.json"), empty]);
         assert!(deny.is_empty() && ask.is_empty() && allow.is_empty());
