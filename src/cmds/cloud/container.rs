@@ -833,13 +833,17 @@ fn k8s_get_target(args: &[String]) -> Option<(&'static str, &[String])> {
 }
 
 fn k8s_get_requests_raw_output(args: &[String]) -> bool {
+    if k8s_get_has_named_resource(args) {
+        return true;
+    }
+
     args.iter().any(|arg| {
         matches!(
             arg.as_str(),
             "-o" | "--output" | "-w" | "--watch" | "--show-labels" | "--show-kind"
         ) || arg.starts_with("-o")
             || arg.starts_with("--output=")
-    }) || k8s_get_has_named_resource(args)
+    })
 }
 
 /// `kubectl get pods NAME` / `get services NAME` returns a single JSON
