@@ -4,6 +4,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
 import RtkOpenCodePlugin, {
+  _pathFromEnv,
   probeRtkHookOpencode,
   resolveRtkPath,
   runHookOpencode,
@@ -114,6 +115,13 @@ after(() => {
   _resetCachedRtkPath()
   rmSync(mockDir, { recursive: true, force: true })
   rmSync(emptyDir, { recursive: true, force: true })
+})
+
+test("PATH lookup accepts Windows/Bun native env casing", () => {
+  assert.equal(_pathFromEnv({ Path: "C:\\tools\\bin" }), "C:\\tools\\bin")
+  assert.equal(_pathFromEnv({ pAtH: "/mixed/case" }), "/mixed/case")
+  assert.equal(_pathFromEnv({ PATH: "/preferred", Path: "/fallback" }), "/preferred")
+  assert.equal(_pathFromEnv({ HOME: "/tmp" }), "")
 })
 
 test("2.0.22: execute.before mutates event.input.command", async () => {

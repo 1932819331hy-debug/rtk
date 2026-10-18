@@ -28,6 +28,16 @@ export function _resetCachedRtkPath(): void {
   probedBin = null
 }
 
+export function _pathFromEnv(env: Record<string, string | undefined>): string {
+  if (env.PATH !== undefined) return env.PATH
+
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toLowerCase() === "path") return value ?? ""
+  }
+
+  return ""
+}
+
 /**
  * Resolves the rtk binary from the system PATH.
  *
@@ -45,7 +55,7 @@ export function _resetCachedRtkPath(): void {
 export function resolveRtkPath(): string | null {
   if (cachedRtkPath && existsSync(cachedRtkPath)) return cachedRtkPath
 
-  const dirs = (process.env.PATH ?? "").split(delimiter).filter(Boolean)
+  const dirs = _pathFromEnv(process.env).split(delimiter).filter(Boolean)
   const exts = process.platform === "win32"
     ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")
     : [""]
