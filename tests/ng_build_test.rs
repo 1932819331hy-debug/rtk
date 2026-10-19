@@ -335,3 +335,126 @@ fn signalled_build_flushes_both_streams_and_does_not_leave_its_child_running() {
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(out.status.signal(), Some(15));
 }
+
+#[test]
+fn known_builder_names_and_targets_are_compacted() {
+    for builder in [
+        "@angular/build:application",
+        "@angular-devkit/build-angular:application",
+        "@angular-devkit/build-angular:browser",
+        "@angular-devkit/build-angular:browser-esbuild",
+    ] {
+        for key in ["architect", "targets"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut cmd = ng_command(dir.path(), &["build", "app"], TABLE, "", 0);
+            let workspace = WORKSPACE
+                .replace("@angular/build:application", builder)
+                .replace("architect", key);
+            fs::write(dir.path().join("angular.json"), workspace).expect("write workspace");
+            let out = cmd.output().expect("run known builder");
+            assert!(out.status.success());
+            assert_eq!(out.stdout, b"Initial chunk files | Names | Raw size | Estimated transfer size\nmain-ABC123.js | main | 150.00 kB | 42.00 kB\n | Initial total | 150.00 kB | 42.00 kB\n", "{builder}, {key}");
+            assert!(out.stderr.is_empty());
+        }
+    }
+}
+
+#[test]
+fn mixed_library_and_empty_workspaces_pass_through() {
+    for workspace in [
+        r#"{"projects":{"app":{"architect":{"build":{"builder":"@angular/build:application"}}},"library":{"architect":{"build":{"builder":"@angular/build:ng-packagr"}}}}}"#,
+        r#"{"projects":{}}"#,
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cmd = ng_command(dir.path(), &["build", "app"], TABLE, "diagnostic\n", 7);
+        fs::write(dir.path().join("angular.json"), workspace).expect("write workspace");
+        let out = cmd.output().expect("run uncertain workspace");
+        assert_eq!(out.status.code(), Some(7));
+        assert_eq!(out.stdout, TABLE.as_bytes());
+        assert_eq!(out.stderr, b"diagnostic\n");
+    }
+}
+
+#[test]
+fn unreadable_workspace_passes_through() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cmd = ng_command(dir.path(), &["build"], TABLE, "", 0);
+    let workspace = dir.path().join("angular.json");
+    fs::remove_file(&workspace).expect("remove workspace file");
+    // Unlike chmod, a directory reliably fails read even when tests run as root.
+    fs::create_dir(workspace).expect("create unreadable workspace");
+    let out = cmd.output().expect("run unreadable workspace");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, TABLE.as_bytes());
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn removed_current_directory_passes_through() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let removed = dir.path().join("removed");
+    fs::create_dir(&removed).expect("create disposable cwd");
+    let ng = ng_command(dir.path(), &["build"], TABLE, "", 0);
+    // Remove only the child's cwd before exec: never change this test process's
+    // cwd, which is shared with other tests. All fake-ng paths remain absolute.
+    let mut cmd = common::native_command("/bin/sh");
+    for (key, value) in ng.get_envs() {
+        if let Some(value) = value {
+            cmd.env(key, value);
+        } else {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.current_dir(&removed)
+        .args(["-c", "rmdir \"$PWD\" && exec \"$@\"", "removed-cwd"])
+        .arg(ng.get_program())
+        .args(ng.get_args());
+    let out = cmd.output().expect("run from deleted cwd");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, TABLE.as_bytes());
+}
+
+#[test]
+fn captured_build_inherits_piped_stdin() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cmd = ng_command(dir.path(), &["build"], "", "", 0);
+    fs::write(
+        dir.path().join("ng"),
+        "#!/bin/sh\nIFS= read -r answer || exit 12\nprintf '%s\\n' \"$answer\"\n",
+    )
+    .expect("write stdin reader");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stdin reader");
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(b"y\n")
+        .expect("write answer");
+    let out = child.wait_with_output().expect("wait stdin reader");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"y\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn compiler_only_failure_with_tee_has_no_recovery_hint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // This real compiler-only failure exceeds the 500-byte recovery threshold;
+    // the smaller TypeScript fixture would never exercise the hint guards.
+    let stdout = include_str!("fixtures/ng_build/template-error.stdout.txt");
+    let stderr = include_str!("fixtures/ng_build/template-error.stderr.txt");
+    let out = ng_command(dir.path(), &["build"], stdout, stderr, 1)
+        .env_remove("RTK_TEE")
+        .output()
+        .expect("run compiler failure with tee enabled");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, stdout.as_bytes());
+    assert_eq!(out.stderr, stderr.as_bytes());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("[full output"));
+}

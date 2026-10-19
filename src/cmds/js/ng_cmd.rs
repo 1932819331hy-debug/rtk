@@ -312,6 +312,37 @@ mod tests {
     }
 
     #[test]
+    fn table_guards_have_exact_output_contracts() {
+        let header = "Initial chunk files   | Names   | Raw size\n";
+        for row in [
+            "not a table row\n",
+            "main.js   |    | 1 kB\n",
+            "main.js   | main   | huge\n",
+        ] {
+            let raw = format!("{header}{row}");
+            assert_eq!(filter_build(&raw), raw, "{row:?}");
+        }
+        for (row, expected) in [
+            ("main.mjs   | main   | 1 kB\n", "main.mjs | main | 1 kB\n"),
+            ("main.js   | main   | -\n", "main.js | main | -\n"),
+        ] {
+            assert_eq!(
+                filter_build(&format!("{header}{row}")),
+                format!("Initial chunk files | Names | Raw size\n{expected}")
+            );
+        }
+    }
+
+    #[test]
+    fn crlf_progress_pair_is_removed_only_before_a_valid_table() {
+        let raw = "❯ Building...\r\n✔ Building...\r\nInitial chunk files   | Names   | Raw size\r\nmain.js   | main   | 1 kB\r\n";
+        assert_eq!(
+            filter_build(raw),
+            "Initial chunk files | Names | Raw size\r\nmain.js | main | 1 kB\r\n"
+        );
+    }
+
+    #[test]
     fn real_success_snapshot_keeps_all_native_fields() {
         let expected = "Initial chunk files | Names | Raw size | Estimated transfer size\n\
 main-VYJRYTPO.js | main | 190.01 kB | 51.90 kB\n\
