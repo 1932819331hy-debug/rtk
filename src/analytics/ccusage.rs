@@ -172,10 +172,15 @@ pub fn fetch(granularity: Granularity) -> Result<Option<Vec<CcusagePeriod>>> {
 
         if matches!(granularity, Granularity::Weekly) {
             if !canonicalize_weekly_keys(&mut periods)? {
-                anyhow::ensure!(
-                    !requested_monday,
-                    "ccusage returned non-Monday weeks after requesting --start-of-week monday"
-                );
+                if requested_monday {
+                    // ccusage 18 can ignore CLI week-start flags when a config
+                    // file is present. Do not join incompatible buckets or let
+                    // that take down the daily/monthly sections of --all.
+                    eprintln!(
+                        "[warn] ccusage returned non-Monday weeks after requesting --start-of-week monday; showing RTK-only weekly data"
+                    );
+                    return Ok(None);
+                }
                 // Legacy ccusage has configurable (default Sunday) weeks.
                 // Current root ccusage uses Monday and rejects this flag.
                 // Preserve weekly-specific config and re-fetch every bucket:

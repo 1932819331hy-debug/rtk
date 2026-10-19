@@ -366,14 +366,17 @@ fn any_valid_non_monday_start_requests_a_monday_retry() {
 }
 
 #[test]
-fn ignored_monday_flag_errors_after_exactly_two_calls() {
+fn ignored_monday_flag_degrades_after_exactly_two_calls() {
     let sandbox = Sandbox::new();
     sandbox.seed(&[("2026-09-28", 1)]);
     let sunday = fixture("period", &[("2026-09-27", 4)]);
     sandbox.stub(&[(&sunday, 0), (&sunday, 0)]);
     let out = sandbox.run("json");
     sandbox.assert_calls(2);
-    assert_fetch_error(&out);
+    assert_rtk_only(&out);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("[warn] ccusage returned non-Monday weeks")
+    );
 }
 
 #[test]
@@ -564,4 +567,105 @@ fn duplicate_current_period_rows_sum_every_metric() {
 #[test]
 fn duplicate_monday_retry_rows_sum_without_initial_spending() {
     assert_duplicate_mondays_are_summed("period", true);
+}
+
+#[test]
+fn non_monday_daily_key_joins_with_exactly_one_call() {
+    let sandbox = Sandbox::new();
+    sandbox.seed(&[("2026-09-30", 1)]);
+    let daily = period_fixture("daily", "date", "2026-09-30");
+    sandbox.stub(&[(&daily, 0)]);
+    let out = sandbox
+        .command()
+        .args(["cc-economics", "--daily", "--format", "json"])
+        .output()
+        .expect("run daily economics CLI");
+    assert_success(&out);
+    assert_eq!(
+        fs::read_to_string(sandbox.root.path().join("calls")).expect("read call log"),
+        "<daily><--json><--since><20250101>\n"
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).expect("valid daily JSON");
+    let rows = report["daily"].as_array().expect("daily rows");
+    assert_eq!(rows.len(), 1);
+    assert_joined(&rows[0], "2026-09-30", 1, 1, 1);
+    assert!(report["weekly"].is_null());
+    assert!(report["monthly"].is_null());
+}
+
+fn period_fixture(granularity: &str, key: &str, date: &str) -> String {
+    let mut value: Value =
+        serde_json::from_str(&fixture(key, &[(date, 1)])).expect("parse test fixture");
+    let rows = value["weekly"].take();
+    json!({(granularity): rows}).to_string()
+}
+
+#[test]
+fn ignored_monday_retry_preserves_all_report_sections() {
+    // Model ccusage 18's observed response with either an empty config or
+    // an explicit Sunday preference. The stub deliberately ignores the flag;
+    // this tests RTK's boundary behavior, not ccusage's config parser.
+    for config in ["{}", r#"{"startOfWeek":"sunday"}"#] {
+        for format in ["json", "csv", "text"] {
+            let sandbox = Sandbox::new();
+            sandbox.seed(&[("2026-09-30", 1)]);
+            let config_dir = sandbox.root.path().join("cwd/.ccusage");
+            fs::create_dir(&config_dir).expect("create isolated ccusage config directory");
+            fs::write(config_dir.join("ccusage.json"), config).expect("write ccusage config");
+            let daily = period_fixture("daily", "date", "2026-09-30");
+            let sunday = fixture("week", &[("2026-09-27", 99)]);
+            let monthly = period_fixture("monthly", "month", "2026-09");
+            sandbox.stub(&[(&daily, 0), (&sunday, 0), (&sunday, 0), (&monthly, 0)]);
+            let out = sandbox
+                .command()
+                .args(["cc-economics", "--all", "--format", format])
+                .output()
+                .expect("run all economics sections");
+            assert_success(&out);
+            assert_eq!(
+                fs::read_to_string(sandbox.root.path().join("calls")).expect("read call log"),
+                format!(
+                    "<daily><--json><--since><20250101>\n{INITIAL_ARGS}{RETRY_ARGS}<monthly><--json><--since><20250101>\n"
+                )
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stderr)
+                    .contains("[warn] ccusage returned non-Monday weeks")
+            );
+            let stdout = String::from_utf8(out.stdout).expect("UTF-8 report");
+            match format {
+                "json" => {
+                    let report: Value = serde_json::from_str(&stdout).expect("complete all JSON");
+                    assert_eq!(report["daily"].as_array().expect("daily rows").len(), 1);
+                    assert_eq!(report["monthly"].as_array().expect("monthly rows").len(), 1);
+                    assert_joined(&report["daily"][0], "2026-09-30", 1, 1, 1);
+                    // Preserve the existing monthly formula (saved divided by
+                    // saved + input + output), independent of weekly fallback.
+                    let mut expected_month = report["daily"][0].clone();
+                    expected_month["label"] = json!("2026-09");
+                    expected_month["rtk_savings_pct"] = json!(40.0);
+                    assert_eq!(report["monthly"][0], expected_month);
+                    let weekly = report["weekly"].as_array().expect("weekly rows");
+                    assert_eq!(weekly.len(), 1);
+                    assert_eq!(weekly[0]["label"], "2026-09-28");
+                    assert_eq!(weekly[0]["rtk_saved_tokens"], 800);
+                    assert!(weekly[0]["cc_cost"].is_null());
+                }
+                "csv" => {
+                    let rows: Vec<_> = stdout.lines().collect();
+                    assert_eq!(rows.len(), 4, "complete daily/weekly/monthly CSV: {stdout}");
+                    assert!(rows[1].starts_with("2026-09-30,2.7000,"));
+                    assert!(rows[2].starts_with("2026-09-28,,"));
+                    assert!(rows[3].starts_with("2026-09,2.7000,"));
+                }
+                _ => {
+                    assert!(stdout.contains("Daily Economics"));
+                    assert!(stdout.contains("Weekly Economics"));
+                    assert!(stdout.contains("Monthly Economics"));
+                    assert!(stdout.contains("2026-09-30"));
+                    assert!(stdout.contains("2026-09-28"));
+                }
+            }
+        }
+    }
 }
