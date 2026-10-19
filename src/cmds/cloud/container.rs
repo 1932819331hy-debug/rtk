@@ -1,5 +1,6 @@
 //! Filters Docker and kubectl output into compact summaries.
 
+use crate::core::arg_tokenizer::{Dialect, TokenKind, ValueSpec, tokenize_grammar};
 use crate::core::guard::never_worse;
 use crate::core::runner::{self, RunOptions};
 use crate::core::shell::display_args;
@@ -833,46 +834,25 @@ fn k8s_get_target(args: &[String]) -> Option<(&'static str, &[String])> {
 }
 
 fn k8s_get_requests_raw_output(args: &[String]) -> bool {
-    if k8s_get_has_named_resource(args) {
-        return true;
-    }
-
-    args.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "-o" | "--output" | "-w" | "--watch" | "--show-labels" | "--show-kind"
-        ) || arg.starts_with("-o")
-            || arg.starts_with("--output=")
+    let takes_value = |kind: TokenKind, name: &str| match (kind, name) {
+        (TokenKind::Short, "n" | "l")
+        | (
+            TokenKind::Long,
+            "namespace" | "context" | "kubeconfig" | "as" | "selector" | "field-selector",
+        ) => Some(ValueSpec::value().claiming_dash_dash()),
+        _ => None,
+    };
+    let tokens = tokenize_grammar(args, &takes_value, Dialect::Posix);
+    tokens.iter().any(|token| match token.kind {
+        // Named get returns a Pod/Service, not the List the compact filter expects.
+        TokenKind::Positional => token.is_free_positional(),
+        TokenKind::DashDash => false,
+        TokenKind::Short if token.text == "A" => false,
+        TokenKind::Long if token.text == "all-namespaces" => false,
+        // Preserve native output/diagnostics for output flags, unknown options,
+        // and missing values rather than guessing their argument grammar.
+        kind => takes_value(kind, token.text).is_none() || token.value(&tokens).is_none(),
     })
-}
-
-/// `kubectl get pods NAME` / `get services NAME` returns a single JSON
-/// object, not a List with `items`. Keep kubectl's native output for a
-/// named query rather than claiming that an existing resource was not found.
-/// Consume common option values so `get pods -n default` still uses the
-/// compact list filter; unknown options conservatively pass through.
-fn k8s_get_has_named_resource(args: &[String]) -> bool {
-    let mut idx = 0;
-    while idx < args.len() {
-        let flag = args[idx].as_str();
-        if matches!(
-            flag,
-            "-n" | "--namespace" | "--context" | "--kubeconfig" | "--as"
-                | "-l" | "--selector" | "--field-selector"
-        ) {
-            idx += 2;
-            continue;
-        }
-        if flag == "--" {
-            return idx + 1 < args.len();
-        }
-        if flag.starts_with('-') {
-            idx += 1;
-            continue;
-        }
-        return true;
-    }
-    false
 }
 
 pub fn run_kubectl_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
@@ -1097,6 +1077,30 @@ api-1  | Connected to database";
         ] {
             let args: Vec<String> = args.into_iter().map(str::to_string).collect();
             assert!(k8s_get_target(&args).is_some(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn test_k8s_list_flag_clusters_and_flag_like_values_still_filter() {
+        for args in [
+            vec!["pods", "-An", "default"],
+            vec!["pods", "--context", "-o"],
+            vec!["pods", "--namespace", "--"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            assert!(k8s_get_target(&args).is_some(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn test_k8s_get_unknown_or_incomplete_options_pass_through() {
+        for args in [
+            vec!["pods", "--new-option=value"],
+            vec!["pods", "-n"],
+            vec!["pods", "--context"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            assert_eq!(k8s_get_target(&args), None, "{args:?}");
         }
     }
 
