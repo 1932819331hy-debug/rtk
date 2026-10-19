@@ -2477,11 +2477,29 @@ fn require_single_script(subcommand: &str, shell: Option<&str>, command: &[Strin
         .exit();
 }
 
-fn run_cli() -> Result<i32> {
-    // Fire-and-forget telemetry ping (1/day, non-blocking)
-    core::telemetry::maybe_ping();
+/// Whether this invocation runs the daily telemetry ping. A parsed
+/// `rtk hook …` command does not: the hook processors run before every
+/// command an agent runs. Anything clap rejects (help, version, a
+/// passthrough command) still runs it.
+fn pings_telemetry(parsed: &Result<Cli, clap::Error>) -> bool {
+    !matches!(
+        parsed,
+        Ok(Cli {
+            command: Commands::Hook { .. },
+            ..
+        })
+    )
+}
 
-    let cli = match try_parse_cli_from(std::env::args_os()) {
+fn run_cli() -> Result<i32> {
+    let parsed = try_parse_cli_from(std::env::args_os());
+
+    // Fire-and-forget telemetry ping (1/day, non-blocking)
+    if pings_telemetry(&parsed) {
+        core::telemetry::maybe_ping();
+    }
+
+    let cli = match parsed {
         Ok(cli) => cli,
         Err(e) => {
             if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
@@ -4008,6 +4026,8 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Git { .. }
             | Commands::Gh { .. }
             | Commands::Glab { .. }
+            | Commands::Aws { .. }
+            | Commands::Psql { .. }
             | Commands::Pnpm { .. }
             | Commands::Err { .. }
             | Commands::Test { .. }
@@ -4026,6 +4046,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Rg { .. }
             | Commands::AstGrep { .. }
             | Commands::Wget { .. }
+            | Commands::Wc { .. }
             | Commands::Jest { .. }
             | Commands::Vitest { .. }
             | Commands::Ctest { .. }
@@ -4042,6 +4063,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Ruff { .. }
             | Commands::Sqlfluff { .. }
             | Commands::Pytest { .. }
+            | Commands::Mypy { .. }
             | Commands::Php { .. }
             | Commands::Phpunit { .. }
             | Commands::Phpstan { .. }
@@ -4056,6 +4078,9 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Pip { .. }
             | Commands::Uv { .. }
             | Commands::Go { .. }
+            | Commands::Gradlew { .. }
+            | Commands::Mvn { .. }
+            | Commands::Mvnd { .. }
             | Commands::Sbt { .. }
             | Commands::GolangciLint { .. }
             | Commands::Gt { .. }
@@ -4077,6 +4102,30 @@ mod tests {
             let cli = Cli::try_parse_from(["rtk", framework, "src/a.test.js"])
                 .expect("rtk <framework> <path> parses");
             assert!(is_operational_command(&cli.command), "{framework}");
+        }
+    }
+
+    #[test]
+    fn test_hook_rewritten_commands_get_the_hook_integrity_check() {
+        let commands: &[&[&str]] = &[
+            &["aws", "s3", "ls"],
+            &["psql", "-c", "select 1"],
+            &["wc", "-l", "src/lib.rs"],
+            &["mypy", "src"],
+            &["gradlew", "build"],
+            &["mvn", "test"],
+            &["mvnd", "test"],
+        ];
+
+        for args in commands {
+            let mut argv = vec!["rtk"];
+            argv.extend_from_slice(args);
+            let cli = Cli::try_parse_from(argv).expect("hook-rewritten command parses");
+            assert!(
+                is_operational_command(&cli.command),
+                "{} must receive the hook-integrity check",
+                args[0]
+            );
         }
     }
 
@@ -5160,6 +5209,35 @@ mod tests {
                 command: HookCommands::Claude
             }
         ));
+    }
+
+    #[test]
+    fn hook_commands_skip_the_telemetry_ping() {
+        for args in [&["rtk", "hook", "claude"][..], &["rtk", "hook", "codex"]] {
+            assert!(
+                !pings_telemetry(&try_parse_cli_from(args)),
+                "{args:?} must not ping"
+            );
+        }
+    }
+
+    #[test]
+    fn other_invocations_still_run_the_ping() {
+        for args in [
+            &["rtk", "ls"][..],
+            &["rtk", "gain"],
+            &["rtk", "--help"],
+            &["rtk", "--version"],
+            // Rejected by clap: an unknown command runs through the fallback,
+            // and a hook with a bad flag never reaches the hook processor.
+            &["rtk", "uname", "-s"],
+            &["rtk", "hook", "claude", "--bogus"],
+        ] {
+            assert!(
+                pings_telemetry(&try_parse_cli_from(args)),
+                "{args:?} must ping"
+            );
+        }
     }
 
     #[test]
