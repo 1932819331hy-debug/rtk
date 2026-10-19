@@ -4,7 +4,7 @@
 
 #![cfg(unix)]
 
-use std::process::Command;
+mod common;
 
 fn shell_quote(path: &std::path::Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
@@ -46,13 +46,9 @@ fn run_with_stub(args: &[&str], stub_stdout: &str) -> (Vec<String>, String) {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rtk"))
+    let out = common::rtk_command()
         .env("PATH", path_with_stub)
         .env("LC_ALL", "C")
-        // Without these the run reads the developer's real config and writes to their real
-        // tracking DB, so the assertions depend on local machine state.
-        .env("HOME", dir.path())
-        .env("RTK_DB_PATH", dir.path().join("rtk.db"))
         .current_dir(dir.path())
         .args(args)
         .output()
