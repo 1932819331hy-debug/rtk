@@ -792,6 +792,61 @@ mod command_tests {
         assert_eq!(code, 0);
     }
 
+    /// npm, vitest and the other Node tools install as `.cmd` wrappers on
+    /// Windows, and `Command::new("npm")` cannot start one: the failure
+    /// `resolved_command` is there for. `which` reads the process's own `PATH`,
+    /// so rather than change it under the tests running beside this one, the
+    /// test runs itself again with the wrapper's directory on the child's.
+    #[cfg(windows)]
+    #[test]
+    fn a_cmd_wrapper_on_path_is_run() {
+        /// Set on the re-run that does the work: the directory holding `hello.cmd`.
+        const WRAPPER_DIR: &str = "RTK_TEST_CMD_WRAPPER_DIR";
+
+        if std::env::var_os(WRAPPER_DIR).is_some() {
+            let (captured, code) = run_for_output(&args(&["hello"])).expect("hello.cmd runs");
+            assert_eq!(code, 0, "{}", captured.content);
+            assert!(
+                captured.content.contains("hello from a .cmd wrapper"),
+                "{}",
+                captured.content
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("hello.cmd"),
+            "@echo off\r\necho hello from a .cmd wrapper\r\n",
+        )
+        .expect("write hello.cmd");
+        let path = std::env::join_paths(std::iter::once(dir.path().to_path_buf()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .expect("a PATH with the wrapper's directory first");
+        // libtest names a test by its path inside the crate.
+        let (_, module) = module_path!()
+            .split_once("::")
+            .expect("a module inside the crate");
+        let exe = std::env::current_exe().expect("the test executable");
+        // nosemgrep: dynamic-command-execution — this test binary, run again with hello.cmd on PATH
+        let output = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg(format!("{module}::a_cmd_wrapper_on_path_is_run"))
+            .env(WRAPPER_DIR, dir.path())
+            .env("PATH", path)
+            .output()
+            .expect("run the test again");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // A name libtest matched nothing with passes vacuously, so the re-run
+        // has to report the one test it ran.
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn api_key_command_resolves_credential_from_stdout() {
         let upstream = UpstreamDef {
