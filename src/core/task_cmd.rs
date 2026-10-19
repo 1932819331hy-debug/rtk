@@ -689,18 +689,17 @@ mod tests {
 
     #[test]
     fn claude_project_dir_respects_custom_config_dir() {
+        // Claude Code names the directory after the absolute path, every
+        // non-alphanumeric character turned into `-`: the separators, and the
+        // `.` and `:` in the path too.
+        #[cfg(windows)]
+        let (cwd, slug) = (r"C:\work\my.project", "C--work-my-project");
+        #[cfg(not(windows))]
+        let (cwd, slug) = ("/work/my.project", "-work-my-project");
+
         let temp = tempfile::tempdir().expect("tempdir");
         let custom_claude = temp.path().join("custom_claude");
-        let project_cwd = temp.path().join("my-project");
-        std::fs::create_dir_all(&project_cwd).expect("cwd");
-
-        let slug: String = project_cwd
-            .to_str()
-            .unwrap()
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '-' })
-            .collect();
-        let expected_dir = custom_claude.join("projects").join(&slug);
+        let expected_dir = custom_claude.join("projects").join(slug);
         std::fs::create_dir_all(&expected_dir).expect("project dir");
 
         crate::core::test_isolation::with_agent_dir(
@@ -708,7 +707,7 @@ mod tests {
             "CLAUDE_CONFIG_DIR",
             &custom_claude,
             || {
-                let resolved = claude_project_dir(&project_cwd);
+                let resolved = claude_project_dir(std::path::Path::new(cwd));
                 assert_eq!(resolved, Some(expected_dir));
             },
         );
