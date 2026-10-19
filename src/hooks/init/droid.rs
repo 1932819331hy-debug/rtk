@@ -459,13 +459,11 @@ pub fn is_configured() -> bool {
         return false;
     };
     for candidate in droid_hook_file_candidates(&droid_dir) {
-        if let Ok(content) = fs::read_to_string(&candidate.path) {
-            let content = strip_leading_bom(&content);
-            if let Ok(root) = from_json_str::<serde_json::Value>(content.trim())
-                && droid_hook_already_present(&root, candidate.layout)
-            {
-                return true;
-            }
+        if let Ok(content) = fs::read_to_string(&candidate.path)
+            && let Ok(root) = from_json_str::<serde_json::Value>(&content)
+            && droid_hook_already_present(&root, candidate.layout)
+        {
+            return true;
         }
     }
     false

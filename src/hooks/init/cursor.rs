@@ -246,37 +246,18 @@ fn remove_cursor_hooks_at(cursor_dir: &Path, ctx: InitContext) -> Result<Vec<Str
     Ok(removed)
 }
 
-/// Returns true if Cursor RTK hook is configured (hooks.json or legacy script).
+/// Returns true if Cursor RTK hook is configured in hooks.json.
 pub fn is_configured() -> bool {
     let Ok(cursor_dir) = resolve_cursor_dir() else {
         return false;
     };
     let hooks_json = cursor_dir.join(HOOKS_JSON);
-    if let Ok(content) = fs::read_to_string(&hooks_json) {
-        let content = strip_leading_bom(&content);
-        if let Ok(root) = from_json_str::<serde_json::Value>(content.trim())
-            && cursor_hook_already_present(&root)
-        {
-            return true;
-        }
+    if let Ok(content) = fs::read_to_string(&hooks_json)
+        && let Ok(root) = from_json_str::<serde_json::Value>(&content)
+    {
+        return cursor_hook_already_present(&root);
     }
-    let legacy_script = cursor_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_FILE);
-    legacy_script.is_file()
-}
-
-/// Returns true if Cursor hook is installed via legacy script instead of binary command.
-pub fn is_outdated() -> bool {
-    let Ok(cursor_dir) = resolve_cursor_dir() else {
-        return false;
-    };
-    let hooks_json = cursor_dir.join(HOOKS_JSON);
-    let binary_registered = fs::read_to_string(&hooks_json)
-        .ok()
-        .and_then(|c| from_json_str::<serde_json::Value>(strip_leading_bom(&c).trim()).ok())
-        .map(|root| cursor_hook_already_present(&root))
-        .unwrap_or(false);
-    let legacy_script = cursor_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_FILE);
-    !binary_registered && legacy_script.is_file()
+    false
 }
 
 #[cfg(test)]

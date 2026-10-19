@@ -992,11 +992,10 @@ pub fn is_configured() -> bool {
         return false;
     };
     let hooks_json = codex_dir.join(HOOKS_JSON);
-    if let Ok(content) = fs::read_to_string(&hooks_json) {
-        let content = strip_leading_bom(&content);
-        if let Ok(root) = from_json_str::<serde_json::Value>(content.trim()) {
-            return codex_hook_already_present(&root);
-        }
+    if let Ok(content) = fs::read_to_string(&hooks_json)
+        && let Ok(root) = from_json_str::<serde_json::Value>(&content)
+    {
+        return codex_hook_already_present(&root);
     }
     false
 }

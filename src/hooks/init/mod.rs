@@ -26,7 +26,7 @@ mod agents_md;
 pub(crate) mod antigravity;
 pub(crate) mod claude;
 pub(crate) mod codex;
-pub(crate) mod copilot;
+mod copilot;
 pub(crate) mod cursor;
 pub(crate) mod droid;
 pub(crate) mod gemini;
@@ -38,8 +38,8 @@ pub(crate) mod trae;
 pub(crate) mod vibe;
 
 // `agents_md` and `pi` hold helpers that several submodules share, so they are
-// glob-imported and reach siblings through `use super::*`; every other submodule is used only
-// from here and is imported by name.
+// glob-imported and reach siblings through `use super::*`; the remaining submodules are
+// imported by name here (and agent modules with hook probes are `pub(crate)` for `hook_check`).
 use agents_md::*;
 use claude::{
     hook_already_present, hook_gaps, remove_hook_from_settings, run_claude_md_mode,
