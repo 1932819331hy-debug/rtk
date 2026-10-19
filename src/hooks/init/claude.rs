@@ -203,9 +203,17 @@ pub(super) fn remove_proxy_env_from_json(root: &mut serde_json::Value) -> bool {
     true
 }
 
-/// Remove RTK hook from settings.json file
-/// Backs up before modification, returns true if hook was found and removed
-pub(super) fn remove_hook_from_settings(ctx: InitContext) -> Result<bool> {
+/// What `remove_settings_entries` took out of settings.json.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SettingsRemoval {
+    pub hook: bool,
+    pub proxy_base_url: bool,
+}
+
+/// Remove the RTK hook and the RTK proxy's `env.ANTHROPIC_BASE_URL` from
+/// settings.json, reporting each separately so uninstall can say which.
+/// Backs up before modification.
+pub(super) fn remove_settings_entries(ctx: InitContext) -> Result<SettingsRemoval> {
     let InitContext { verbose, .. } = ctx;
     let claude_dir = resolve_claude_dir()?;
     let settings_path = claude_dir.join(SETTINGS_JSON);
@@ -214,7 +222,7 @@ pub(super) fn remove_hook_from_settings(ctx: InitContext) -> Result<bool> {
         if verbose > 0 {
             eprintln!("settings.json not found, nothing to remove");
         }
-        return Ok(false);
+        return Ok(SettingsRemoval::default());
     };
 
     let removed_hook = remove_hook_from_json(&mut root);
@@ -235,7 +243,10 @@ pub(super) fn remove_hook_from_settings(ctx: InitContext) -> Result<bool> {
         )?;
     }
 
-    Ok(removed)
+    Ok(SettingsRemoval {
+        hook: removed_hook,
+        proxy_base_url: removed_env,
+    })
 }
 
 /// Orchestrator: patch settings.json with RTK hook (binary command variant)
@@ -1361,7 +1372,13 @@ mod tests {
             )
             .unwrap();
 
-            assert!(remove_hook_from_settings(InitContext::default()).unwrap());
+            assert_eq!(
+                remove_settings_entries(InitContext::default()).unwrap(),
+                SettingsRemoval {
+                    hook: true,
+                    proxy_base_url: true
+                }
+            );
 
             let root: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
@@ -1388,7 +1405,13 @@ mod tests {
             )
             .unwrap();
 
-            assert!(remove_hook_from_settings(InitContext::default()).unwrap());
+            assert_eq!(
+                remove_settings_entries(InitContext::default()).unwrap(),
+                SettingsRemoval {
+                    hook: false,
+                    proxy_base_url: true
+                }
+            );
 
             let root: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
