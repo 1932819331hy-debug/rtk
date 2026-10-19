@@ -866,12 +866,37 @@ mod tests {
         let cfg = temp_cfg(dir.path());
         let first = store_inner(&cfg, b"out-25833387", "cmd", Some(1), 1).unwrap();
         let second = store_inner(&cfg, b"out-36334097", "cmd", Some(1), 1).unwrap();
-        assert_ne!(first.hash, second.hash);
+        assert_eq!(first.hash, "4ce95baf880ee759");
+        assert_eq!(second.hash, "4ce95baf880e306f");
 
         let conn = open(&cfg).unwrap();
         for (stored, content) in [(&first, b"out-25833387"), (&second, b"out-36334097")] {
             let row = load_by_hash(&conn, &stored.hash).unwrap().expect("row");
             assert_eq!(decode(&row).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn test_12_char_hint_resolves_after_the_same_output_is_stored_again() {
+        // A row stored before the key was widened keeps its 12-char key; the
+        // same output stored again gets the 16-char key that starts with it.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = temp_cfg(dir.path());
+        let stored = store_inner(&cfg, b"same output", "cmd", Some(1), 1).unwrap();
+        let conn = open(&cfg).unwrap();
+        let old = &stored.hash[..12];
+        conn.execute(
+            "UPDATE recall SET hash = ?1 WHERE hash = ?2",
+            params![old, stored.hash],
+        )
+        .unwrap();
+        let again = store_inner(&cfg, b"same output", "cmd", Some(1), 1).unwrap();
+        assert_ne!(again.hash, old);
+
+        for hint in [old, again.hash.as_str()] {
+            let row = load_by_hash(&conn, hint).unwrap().expect("row");
+            assert_eq!(row.hash, hint);
+            assert_eq!(decode(&row).unwrap(), b"same output");
         }
     }
 
