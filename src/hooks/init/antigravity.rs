@@ -161,17 +161,12 @@ pub fn migrate_legacy_rules_at(
     ctx: InitContext,
 ) -> Option<LegacyRulesAction> {
     let legacy_file = workspace_root.join(LEGACY_RULES_REL_PATH);
-    match fs::symlink_metadata(&legacy_file) {
-        Ok(meta) if meta.is_dir() => return None,
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            eprintln!(
-                "  [warn] Failed to clean legacy Antigravity rules file {}: {e}",
-                legacy_file.display()
-            );
-            return None;
-        }
+    let is_regular_file = match fs::metadata(&legacy_file) {
+        Ok(meta) => meta.is_file(),
+        Err(_) => false,
+    };
+    if !is_regular_file {
+        return None;
     }
 
     let raw = match fs::read_to_string(&legacy_file) {
@@ -215,16 +210,24 @@ pub fn migrate_legacy_rules_at(
     let raw_trimmed_end = raw.trim_end();
     for known in &LEGACY_ANTIGRAVITY_TEXTS {
         let target_trimmed = known.trim();
-        let crlf_suffix = format!("\r\n\r\n{}", target_trimmed.replace('\n', "\r\n"));
+        let crlf_text = target_trimmed.replace('\n', "\r\n");
+        let crlf_suffix = format!("\r\n\r\n{crlf_text}");
+        let win_append_suffix = format!("\n\n{crlf_text}");
         let lf_suffix = format!("\n\n{target_trimmed}");
 
         let remaining_bytes = if let Some(prefix) = raw_trimmed_end.strip_suffix(&crlf_suffix) {
+            prefix
+        } else if let Some(prefix) = raw_trimmed_end.strip_suffix(&win_append_suffix) {
             prefix
         } else if let Some(prefix) = raw_trimmed_end.strip_suffix(&lf_suffix) {
             prefix
         } else {
             continue;
         };
+
+        if remaining_bytes.contains("RTK") || remaining_bytes.contains("rtk") {
+            continue;
+        }
 
         if !ctx.dry_run {
             if let Err(e) = atomic_write(&legacy_file, remaining_bytes) {
@@ -695,6 +698,32 @@ mod tests {
         );
         let updated = fs::read_to_string(&legacy_file).unwrap();
         assert_eq!(updated, user_content);
+    }
+
+    #[test]
+    fn test_migrate_legacy_rules_windows_crlf_suffix_preserves_crlf_user_bytes() {
+        let user_content = "# Team rules\r\n\r\nAlways write tests.";
+        for text in [
+            LEGACY_ANTIGRAVITY_RULES_V036,
+            LEGACY_ANTIGRAVITY_RULES_V044,
+            LEGACY_ANTIGRAVITY_RULES_V049,
+        ] {
+            let temp = TempDir::new().unwrap();
+            let legacy_file = temp.path().join(LEGACY_RULES_REL_PATH);
+            fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
+            let crlf_legacy = text.replace('\n', "\r\n");
+            // Windows writer appended "\n\n" followed by CRLF text
+            let full_content = format!("{user_content}\n\n{crlf_legacy}");
+            fs::write(&legacy_file, &full_content).unwrap();
+
+            let action = migrate_legacy_rules_at(temp.path(), InitContext::default());
+            assert_eq!(
+                action,
+                Some(LegacyRulesAction::StrippedSuffix(legacy_file.clone()))
+            );
+            let updated = fs::read_to_string(&legacy_file).unwrap();
+            assert_eq!(updated, user_content);
+        }
     }
 
     #[test]

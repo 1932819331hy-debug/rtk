@@ -426,6 +426,42 @@ fn antigravity_init_strips_crlf_suffix_preserving_crlf_user_content() {
 }
 
 #[test]
+fn antigravity_init_strips_windows_crlf_suffix_preserving_crlf_user_content() {
+    let user_content = "# Team rules\r\n\r\nAlways write tests.";
+    for legacy_text in LEGACY_TEXTS {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let legacy_file = project.path().join(LEGACY_RULES_PATH);
+        fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
+        let crlf_legacy = legacy_text.replace('\n', "\r\n");
+        // Windows pre-plugin releases appended with "\n\n" separator followed by CRLF text
+        fs::write(&legacy_file, format!("{user_content}\n\n{crlf_legacy}")).unwrap();
+
+        let output = run_init(project.path(), home.path(), &["--agent", "antigravity"]);
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("  Legacy: removed awareness text from ")
+                && stdout.contains(LEGACY_RULES_PATH),
+            "{stdout}"
+        );
+        let remaining = fs::read_to_string(&legacy_file).unwrap();
+        assert_eq!(remaining, user_content);
+
+        // Also test uninstall
+        fs::write(&legacy_file, format!("{user_content}\n\n{crlf_legacy}")).unwrap();
+        let uninst_out = run_init(
+            project.path(),
+            home.path(),
+            &["--agent", "antigravity", "--uninstall"],
+        );
+        assert!(uninst_out.status.success());
+        let uninst_remaining = fs::read_to_string(&legacy_file).unwrap();
+        assert_eq!(uninst_remaining, user_content);
+    }
+}
+
+#[test]
 fn antigravity_init_leaves_single_newline_separator_untouched() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -562,9 +598,31 @@ fn antigravity_dry_run_leaves_legacy_rules_in_place() {
         legacy_file.exists(),
         "Uninstall dry-run must not remove legacy file"
     );
+
+    // Pin mutation: dry-run on an appended file must not rewrite disk contents
+    let user_content = "# Team rules\n\nAlways write tests.";
+    let appended_content = format!("{user_content}\n\n{LEGACY_V036}");
+    fs::write(&legacy_file, &appended_content).unwrap();
+    let output = run_init(
+        project.path(),
+        home.path(),
+        &["--agent", "antigravity", "--dry-run"],
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[dry-run] would remove legacy awareness text from"),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(&legacy_file).unwrap(),
+        appended_content,
+        "Dry run must not rewrite appended file"
+    );
 }
 
 #[test]
+#[cfg(unix)] // dirs::home_dir uses Windows Known Folder API, so HOME cannot isolate ~/.gemini/config on Windows.
 fn antigravity_global_init_cleans_workspace_legacy_rules() {
     let user_content = "# Team rules\n\nAlways write tests.";
     for legacy_text in LEGACY_TEXTS {
@@ -613,57 +671,206 @@ fn antigravity_global_init_cleans_workspace_legacy_rules() {
 fn antigravity_readonly_legacy_rules_warns_and_succeeds() {
     use std::os::unix::fs::PermissionsExt;
 
+    // 1. Test Install under read-only rules directory
+    {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let legacy_file = project.path().join(LEGACY_RULES_PATH);
+        let rules_dir = legacy_file.parent().unwrap();
+        fs::create_dir_all(rules_dir).unwrap();
+        fs::write(&legacy_file, LEGACY_V036).unwrap();
+
+        let mut perms = fs::metadata(rules_dir).expect("meta").permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(rules_dir, perms.clone()).expect("chmod");
+
+        // Probe write permission first to detect if we're running as root
+        let probe = rules_dir.join(".rtk-perm-probe");
+        if fs::write(&probe, b"x").is_ok() {
+            let _ = fs::remove_file(&probe);
+            perms.set_mode(0o755);
+            let _ = fs::set_permissions(rules_dir, perms);
+            eprintln!("skipped: filesystem does not enforce write permissions (running as root?)");
+            return;
+        }
+
+        let install_out = run_init(project.path(), home.path(), &["--agent", "antigravity"]);
+
+        perms.set_mode(0o755);
+        fs::set_permissions(rules_dir, perms).expect("chmod back");
+
+        assert!(
+            install_out.status.success(),
+            "install must succeed even when legacy cleanup fails"
+        );
+        assert!(
+            project
+                .path()
+                .join(".agents/plugins/rtk/plugin.json")
+                .is_file(),
+            "plugin must be installed"
+        );
+        let install_stdout = String::from_utf8_lossy(&install_out.stdout);
+        assert!(
+            !install_stdout.contains("Legacy:"),
+            "failed removal must not report Legacy on stdout: {install_stdout}"
+        );
+        let install_stderr = String::from_utf8_lossy(&install_out.stderr);
+        assert!(
+            install_stderr.contains("[warn]")
+                && install_stderr.contains("antigravity-rtk-rules.md"),
+            "expected warning naming legacy file, got: {install_stderr}"
+        );
+    }
+
+    // 2. Test Uninstall under read-only rules directory
+    {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let legacy_file = project.path().join(LEGACY_RULES_PATH);
+        let rules_dir = legacy_file.parent().unwrap();
+        fs::create_dir_all(rules_dir).unwrap();
+        fs::write(&legacy_file, LEGACY_V036).unwrap();
+
+        // First install cleanly so there is an existing plugin directory to uninstall
+        let pre_install = run_init(project.path(), home.path(), &["--agent", "antigravity"]);
+        assert!(pre_install.status.success());
+        // Re-write legacy rules file in case pre_install cleaned it
+        fs::write(&legacy_file, LEGACY_V036).unwrap();
+
+        let mut perms = fs::metadata(rules_dir).expect("meta").permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(rules_dir, perms.clone()).expect("chmod");
+
+        let uninstall_out = run_init(
+            project.path(),
+            home.path(),
+            &["--agent", "antigravity", "--uninstall"],
+        );
+
+        perms.set_mode(0o755);
+        fs::set_permissions(rules_dir, perms).expect("chmod back");
+
+        assert!(
+            uninstall_out.status.success(),
+            "uninstall must succeed even when legacy cleanup fails"
+        );
+        assert!(
+            !project.path().join(".agents/plugins/rtk").exists(),
+            "plugin directory must be removed"
+        );
+        let uninstall_stdout = String::from_utf8_lossy(&uninstall_out.stdout);
+        assert!(
+            uninstall_stdout.contains("RTK uninstalled for Google Antigravity:"),
+            "{uninstall_stdout}"
+        );
+        let uninstall_stderr = String::from_utf8_lossy(&uninstall_out.stderr);
+        assert!(
+            uninstall_stderr.contains("[warn]")
+                && uninstall_stderr.contains("antigravity-rtk-rules.md"),
+            "expected warning naming legacy file, got: {uninstall_stderr}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn antigravity_readonly_appended_rules_warns_and_succeeds() {
+    use std::os::unix::fs::PermissionsExt;
+
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let legacy_file = project.path().join(LEGACY_RULES_PATH);
     let rules_dir = legacy_file.parent().unwrap();
     fs::create_dir_all(rules_dir).unwrap();
-    fs::write(&legacy_file, LEGACY_V036).unwrap();
+    let user_content = "# Team rules\n\nAlways write tests.";
+    let full_content = format!("{user_content}\n\n{LEGACY_V036}");
+    fs::write(&legacy_file, &full_content).unwrap();
 
-    fs::set_permissions(rules_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let mut perms = fs::metadata(rules_dir).expect("meta").permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(rules_dir, perms.clone()).expect("chmod");
+
+    let probe = rules_dir.join(".rtk-perm-probe");
+    if fs::write(&probe, b"x").is_ok() {
+        let _ = fs::remove_file(&probe);
+        perms.set_mode(0o755);
+        let _ = fs::set_permissions(rules_dir, perms);
+        return;
+    }
 
     let install_out = run_init(project.path(), home.path(), &["--agent", "antigravity"]);
+
+    perms.set_mode(0o755);
+    fs::set_permissions(rules_dir, perms).expect("chmod back");
+
+    assert!(install_out.status.success());
+    let install_stdout = String::from_utf8_lossy(&install_out.stdout);
     assert!(
-        install_out.status.success(),
-        "install must succeed even when legacy cleanup fails"
-    );
-    assert!(
-        project
-            .path()
-            .join(".agents/plugins/rtk/plugin.json")
-            .is_file(),
-        "plugin must be installed"
+        !install_stdout.contains("Legacy:"),
+        "failed write must not report Legacy on stdout: {install_stdout}"
     );
     let install_stderr = String::from_utf8_lossy(&install_out.stderr);
     assert!(
         install_stderr.contains("[warn]") && install_stderr.contains("antigravity-rtk-rules.md"),
-        "expected warning naming legacy file, got: {install_stderr}"
+        "{install_stderr}"
     );
+    assert_eq!(
+        fs::read_to_string(&legacy_file).unwrap(),
+        full_content,
+        "failed write must leave file untouched"
+    );
+}
 
-    let uninstall_out = run_init(
-        project.path(),
-        home.path(),
-        &["--agent", "antigravity", "--uninstall"],
-    );
-    assert!(
-        uninstall_out.status.success(),
-        "uninstall must succeed even when legacy cleanup fails"
-    );
-    assert!(
-        !project.path().join(".agents/plugins/rtk").exists(),
-        "plugin directory must be removed"
-    );
-    let uninstall_stdout = String::from_utf8_lossy(&uninstall_out.stdout);
-    assert!(
-        uninstall_stdout.contains("RTK uninstalled for Google Antigravity:"),
-        "{uninstall_stdout}"
-    );
-    let uninstall_stderr = String::from_utf8_lossy(&uninstall_out.stderr);
-    assert!(
-        uninstall_stderr.contains("[warn]")
-            && uninstall_stderr.contains("antigravity-rtk-rules.md"),
-        "expected warning naming legacy file, got: {uninstall_stderr}"
-    );
+#[test]
+fn antigravity_init_ordering_leaves_legacy_rules_on_install_failure() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let legacy_file = project.path().join(LEGACY_RULES_PATH);
+    fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
+    fs::write(&legacy_file, LEGACY_V036).unwrap();
 
-    fs::set_permissions(rules_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    // Create .agents/plugins as a regular file so fs::create_dir_all(&rules_dir) fails on install
+    let plugins_path = project.path().join(".agents/plugins");
+    fs::write(&plugins_path, "not a directory").unwrap();
+
+    let output = run_init(project.path(), home.path(), &["--agent", "antigravity"]);
+    assert!(
+        !output.status.success(),
+        "install must fail when plugin directory cannot be created"
+    );
+    assert!(
+        legacy_file.exists(),
+        "legacy file must be untouched when plugin installation fails"
+    );
+    assert_eq!(
+        fs::read_to_string(&legacy_file).unwrap(),
+        LEGACY_V036,
+        "legacy file content must be unchanged"
+    );
+}
+
+#[test]
+fn antigravity_init_ignores_non_utf8_legacy_file() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let legacy_file = project.path().join(LEGACY_RULES_PATH);
+    fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
+    let invalid_bytes = b"\xff\xfe\x00not utf8 content";
+    fs::write(&legacy_file, invalid_bytes).unwrap();
+
+    let output = run_init(project.path(), home.path(), &["--agent", "antigravity"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("Legacy:"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("[warn]"),
+        "non-UTF-8 file must be ignored silently: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&legacy_file).unwrap(),
+        invalid_bytes,
+        "non-UTF-8 file must remain untouched"
+    );
 }
