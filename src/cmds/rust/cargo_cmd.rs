@@ -2403,6 +2403,19 @@ error: test run failed
     }
 
     #[test]
+    fn test_filter_cargo_nextest_combined_annotation_keeps_failed_and_skipped() {
+        // cargo-nextest 0.9.143 with retries: `(1 slow, 1 flaky)` after `passed`
+        let output =
+            include_str!("../../../tests/fixtures/cargo_nextest_slow_flaky_failed_raw.txt");
+        let result = filter_cargo_nextest(output);
+        assert!(
+            result.contains("cargo nextest: 2 passed, 1 failed, 4 skipped (1 binary, 1.503s)"),
+            "should keep failed and skipped counts: {}",
+            result
+        );
+    }
+
+    #[test]
     fn test_filter_cargo_nextest_summary_regex_fallback() {
         let output = r#"    Starting 5 tests across 1 binary
         PASS [   0.005s] (5/5) test_last
