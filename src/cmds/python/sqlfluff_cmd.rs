@@ -499,6 +499,23 @@ mod tests {
         assert!(out.contains("+1 more rules"), "{out}");
     }
 
+    #[test]
+    fn long_shared_descriptions_are_truncated_in_top_rules() {
+        // Captured from SQLFluff 4.3.0:
+        // `sqlfluff lint --dialect ansi --rules RF01 --format json models` over
+        // a.sql and b.sql, each selecting `c.reason` from a table not aliased c.
+        let input = include_str!("../../../tests/fixtures/sqlfluff_lint_long_description_raw.json");
+        let out = filter_sqlfluff_lint_json(input);
+        assert!(
+            out.contains("  RF01 (2x, first at models/a.sql:1): Reference 'c.reason' refers to table/view not found in the FROM clause or found in ancestor state...\n"),
+            "{out}"
+        );
+        assert!(!out.contains("ancestor statement."), "{out}");
+        for location in ["  models/a.sql:1:8 RF01", "  models/b.sql:1:8 RF01"] {
+            assert!(out.lines().any(|line| line == location), "{out}");
+        }
+    }
+
     // ── exit-code semantics ─────────────────────────────────────────────────
     //
     // sqlfluff exits 1 whenever it finds violations. That is the normal case,

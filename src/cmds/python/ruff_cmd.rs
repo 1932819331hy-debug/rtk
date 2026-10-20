@@ -540,6 +540,45 @@ mod tests {
     }
 
     #[test]
+    fn tied_files_and_rules_are_listed_by_name() {
+        // Captured from Ruff 0.16.6:
+        // `ruff check --isolated --select ALL --output-format=json src` over
+        // alpha.py, beta.py and gamma.py, each containing `import os, sys`, so
+        // every file and every single-occurrence rule ties on its count. Only
+        // the machine-specific filename prefix was normalized to /fixture.
+        let input = include_str!("../../../tests/fixtures/ruff_check_tied_raw.json");
+        let expected_rules = "Top rules:\n  F401 (6x)\n  CPY001 (3x): Missing copyright notice at top of file\n  D100 (3x): Missing docstring in public module\n  E401 (3x): Multiple imports on one line\n  I001 (3x): Import block is un-sorted or un-formatted\n";
+        let expected_files = "Top files:\n\
+            \x20 src/alpha.py (6 issues)\n    F401 (2)\n    CPY001 (1)\n    D100 (1)\n\
+            \x20 src/beta.py (6 issues)\n    F401 (2)\n    CPY001 (1)\n    D100 (1)\n\
+            \x20 src/gamma.py (6 issues)\n    F401 (2)\n    CPY001 (1)\n    D100 (1)\n";
+        // Each run hashes its maps differently; a count-only sort would pass
+        // one run by luck but not ten.
+        for _ in 0..10 {
+            let out = filter_ruff_check_json(input);
+            assert!(out.contains(expected_rules), "{out}");
+            assert!(out.contains(expected_files), "{out}");
+        }
+    }
+
+    #[test]
+    fn long_shared_descriptions_are_truncated_in_top_rules() {
+        // Captured from Ruff 0.16.6:
+        // `ruff check --isolated --select F401 --output-format=json src` over two
+        // modules importing the same long module name. Only the machine-specific
+        // filename prefix was normalized to /fixture.
+        let input = include_str!("../../../tests/fixtures/ruff_check_long_message_raw.json");
+        let out = filter_ruff_check_json(input);
+        assert!(
+            out.contains("  F401 (2x): `a_really_long_package_name_for_testing.with_a_long_submodule_name.and_yet_another_module` import...\n"),
+            "{out}"
+        );
+        assert!(!out.contains("imported but unused"), "{out}");
+        assert!(out.contains("  src/pkg_a/mod.py:1:8 F401\n"), "{out}");
+        assert!(out.contains("  src/pkg_b/mod.py:1:8 F401\n"), "{out}");
+    }
+
+    #[test]
     fn test_filter_ruff_check_with_issues() {
         let output = r#"[
   {
