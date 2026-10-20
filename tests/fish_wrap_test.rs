@@ -774,10 +774,14 @@ mode = "swap"
             let Ok(shell_path) = which::which(shell) else {
                 continue;
             };
-            let output = Command::new(shell_path)
-                .args(["-c", &probe])
-                .output()
-                .unwrap_or_else(|e| panic!("run {shell}: {e}"));
+            // Through `native_command`: `fish -c` sources the user's
+            // `config.fish`, and anything it prints would land on the stdout
+            // compared here byte for byte.
+            let output =
+                crate::common::native_command(shell_path.to_str().expect("shell path is UTF-8"))
+                    .args(["-c", &probe])
+                    .output()
+                    .unwrap_or_else(|e| panic!("run {shell}: {e}"));
             assert!(output.status.success(), "{shell} must parse the wrapping");
             assert_eq!(
                 String::from_utf8_lossy(&output.stdout),
@@ -787,15 +791,29 @@ mode = "swap"
         }
     }
 
+    /// Both branches assert: with `fish` the wrapped script executes and
+    /// propagates its exit code, without it `rtk run --shell fish` reports
+    /// exit 127 rather than appear to have run. This is the one case that runs
+    /// a wrapped script instead of only emitting one, and CI installs `fish` on
+    /// Linux and macOS.
     #[test]
-    #[ignore] // executes real fish; run with: cargo test --ignored
     fn wrapped_multiline_fish_script_executes_and_propagates_exit_code() {
+        let script = "if test -d /\n  echo yes\nelse\n  echo no\nend";
         let Ok(fish) = which::which("fish") else {
+            let output = rtk()
+                .args(["run", "--shell", "fish", "-c", script])
+                .output()
+                .expect("run rtk run");
+            assert_eq!(
+                output.status.code(),
+                Some(127),
+                "an unresolvable shell must report, not run"
+            );
+            assert!(output.stdout.is_empty());
             return;
         };
-        let script = "if test -d /\n  echo yes\nelse\n  echo no\nend";
 
-        let direct = Command::new(&fish)
+        let direct = crate::common::native_command(fish.to_str().expect("fish path is UTF-8"))
             .args(["-c", script])
             .output()
             .expect("run fish directly");
@@ -805,6 +823,10 @@ mode = "swap"
             .expect("run rtk run");
 
         assert!(wrapped.status.success());
+        assert!(
+            !direct.stdout.is_empty(),
+            "the compared output must be real"
+        );
         assert_eq!(
             wrapped.stdout, direct.stdout,
             "output must match direct fish"
