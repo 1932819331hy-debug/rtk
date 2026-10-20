@@ -214,8 +214,9 @@ pub fn filter_json_string(json_str: &str, max_depth: usize) -> Result<String> {
 const MAX_SCHEMA_KEYS: usize = 16;
 
 /// Render `value` as a compact schema (`{a:int,b:{c:string}}`), with no
-/// indentation or newlines so it stays at or under the minified input that
-/// `--keys-only` replaces.
+/// indentation or newlines. On real payloads that is far smaller than the
+/// input; a short string value or a small array can still cost a few bytes
+/// more (`"a":"b"` becomes `a:string`).
 fn extract_schema(value: &Value, depth: usize, max_depth: usize) -> String {
     if depth > max_depth {
         return "...".to_string();
@@ -270,11 +271,29 @@ fn extract_schema(value: &Value, depth: usize, max_depth: usize) -> String {
                         break;
                     }
                     let val_schema = extract_schema(&map[*key], depth + 1, max_depth);
-                    parts.push(format!("{}:{}", key, val_schema));
+                    parts.push(format!("{}:{}", schema_key(key), val_schema));
                 }
                 format!("{{{}}}", parts.join(","))
             }
         }
+    }
+}
+
+/// A key that could be read as schema syntax (empty, a delimiter, a `...`
+/// marker, whitespace or a control character) is printed JSON-quoted; any
+/// other key stays bare.
+fn schema_key(key: &str) -> Cow<'_, str> {
+    let bare = !key.is_empty()
+        && !key.starts_with("...")
+        && !key.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(c, ',' | ':' | '{' | '}' | '[' | ']' | '"' | '\\')
+        });
+    if bare {
+        Cow::Borrowed(key)
+    } else {
+        Cow::Owned(Value::from(key).to_string())
     }
 }
 
@@ -421,8 +440,8 @@ mod tests {
         // the raw JSON back whenever the schema was longer — printing the very
         // values the flag exists to hide. Short values make that the common
         // case, so a small config or credential file leaked while a large one
-        // did not. Assert on quotes: extract_schema emits keys unquoted, so a
-        // `"` anywhere in the output can only have come from a raw value.
+        // did not. Assert on quotes: these keys print bare, so a `"` anywhere
+        // in the output can only have come from a raw value.
         let short_values = format!(
             "{{{}}}",
             (0..11)
@@ -446,9 +465,9 @@ mod tests {
 
     #[test]
     fn test_keys_only_schema_is_no_longer_than_input() {
-        // `--keys-only` always prints the schema, so it must not cost more
-        // than the minified input it replaces. The old indented layout did:
-        // leak.json 31 → 36 B and the 4-level chain 30 → 79 B.
+        // `--keys-only` always prints the schema. On these inputs the compact
+        // form is no longer than the minified input, where the indented layout
+        // was: leak.json 31 → 36 B and the 4-level chain 30 → 79 B.
         for raw in [
             r#"{"a":1,"b":"secretvalue","c":3}"#,
             r#"{"a":{"b":{"c":{"d":"deep"}}}}"#,
@@ -464,6 +483,23 @@ mod tests {
                 !shown.contains('"'),
                 "keys-only output quoted a value: {shown:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_keys_only_prints_schema_where_never_worse_would_pick_raw() {
+        // Short values make the schema the longer output; never_worse would
+        // print these inputs verbatim, values included.
+        for (raw, expected) in [
+            (
+                r#"{"cc":"FR","n":"3","ok":"Y"}"#,
+                "{cc:string,n:string,ok:string}",
+            ),
+            ("[1,2]", "[int] (2)"),
+        ] {
+            assert_eq!(never_worse(raw, expected), raw, "guard premise for {raw}");
+            let shown = render_json(raw, 5, true).expect("must render");
+            assert_eq!(shown, expected, "for {raw}");
         }
     }
 
@@ -499,18 +535,42 @@ mod tests {
             )
         };
 
-        let sixteen = filter_json_string(&make(16), 5).unwrap();
+        let sixteen = filter_json_string(&make(16), 5).expect("16-key object must parse");
         assert_eq!(sixteen.matches(":int").count(), 16, "{sixteen:?}");
         assert!(
             !sixteen.contains("+0"),
             "16-key object reported an empty cap: {sixteen:?}"
         );
 
-        let seventeen = filter_json_string(&make(17), 5).unwrap();
+        let seventeen = filter_json_string(&make(17), 5).expect("17-key object must parse");
         assert_eq!(seventeen.matches(":int").count(), 16, "{seventeen:?}");
         assert!(
             seventeen.contains("...+1"),
             "17-key object should show 16 keys plus +1: {seventeen:?}"
         );
+    }
+
+    #[test]
+    fn test_keys_only_quotes_keys_that_read_as_syntax() {
+        for (raw, expected) in [
+            (r#"{"user_id":1,"a.b":2}"#, "{a.b:int,user_id:int}"),
+            (r#"{"a":{"b":1,"c":1}}"#, "{a:{b:int,c:int}}"),
+            (r#"{"a":{"b:int,c":1}}"#, r#"{a:{"b:int,c":int}}"#),
+            (r#"{"a,b":1}"#, r#"{"a,b":int}"#),
+            (r#"{"}":1}"#, r#"{"}":int}"#),
+            (r#"{"[x]":1}"#, r#"{"[x]":int}"#),
+            (r#"{"a\nb":1}"#, r#"{"a\nb":int}"#),
+            (r#"{"a b":1}"#, r#"{"a b":int}"#),
+            (r#"{"a\u0001b":1}"#, r#"{"a\u0001b":int}"#),
+            (r#"{"a\"b":1}"#, r#"{"a\"b":int}"#),
+            (r#"{"a\\b":1}"#, r#"{"a\\b":int}"#),
+            (r#"{"":1}"#, r#"{"":int}"#),
+            (r#"{"...+3":1}"#, r#"{"...+3":int}"#),
+            (r#"{"say \"hi\"":1}"#, r#"{"say \"hi\"":int}"#),
+            (r#"{"https://x.io:443":1}"#, r#"{"https://x.io:443":int}"#),
+        ] {
+            let shown = filter_json_string(raw, 5).expect("must parse");
+            assert_eq!(shown, expected, "for {raw}");
+        }
     }
 }
