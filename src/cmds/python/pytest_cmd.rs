@@ -11,6 +11,8 @@ use std::sync::LazyLock;
 
 const MAX_XFAIL: usize = CAP_WARNINGS;
 const MAX_PYTEST_FAILURES: usize = CAP_WARNINGS;
+const MAX_TRACEBACK_LINES: usize = 3;
+const MAX_ERROR_LINES: usize = 4;
 static PYTEST_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^(?:=+\s*)?\d+ [^,\r\n=]+?(?:, \d+ [^,\r\n=]+?)* in \d+(?:\.\d+)?(?:s| seconds)(?: \((?:\d+ days?, )?\d+:\d{2}:\d{2}\))?(?:\s*=+)?$",
@@ -291,8 +293,22 @@ fn build_pytest_summary(
         }
 
         // Show relevant error lines (assertions, errors, file locations)
-        let mut relevant_lines = 0;
-        for line in &lines[1..] {
+        let body = &lines[1..];
+        let error_total = body.iter().filter(|l| is_error_line(l)).count();
+        let error_shown = error_total.min(MAX_ERROR_LINES);
+        let error_head = error_shown / 2;
+        let error_tail_start = error_total - (error_shown - error_head);
+        let mut context_left = MAX_TRACEBACK_LINES.saturating_sub(error_shown);
+        let mut error_index = 0;
+        for line in body {
+            if is_error_line(line) {
+                if error_index < error_head || error_index >= error_tail_start {
+                    result.push_str(&format!("     {}\n", truncate(line, 100)));
+                }
+                error_index += 1;
+                continue;
+            }
+
             let line_lower = line.to_lowercase();
             let is_relevant = line.trim().starts_with('>')
                 || line.trim().starts_with('E')
@@ -300,9 +316,9 @@ fn build_pytest_summary(
                 || line_lower.contains("error")
                 || line.contains(".py:");
 
-            if is_relevant && relevant_lines < 3 {
+            if is_relevant && context_left > 0 {
                 result.push_str(&format!("     {}\n", truncate(line, 100)));
-                relevant_lines += 1;
+                context_left -= 1;
             }
         }
 
@@ -323,6 +339,10 @@ fn build_pytest_summary(
     }
 
     result.trim().to_string()
+}
+
+fn is_error_line(line: &str) -> bool {
+    line.starts_with("E ")
 }
 
 fn parse_summary_line(summary: &str) -> PytestCounts {
@@ -803,6 +823,62 @@ E   RuntimeError: boom at import
             "got: {result}"
         );
         assert!(result.contains("boom at import"), "got: {result}");
+    }
+
+    #[test]
+    fn test_filter_pytest_collection_import_error_keeps_message() {
+        let output = include_str!("../../../tests/fixtures/pytest_collection_import_error_raw.txt");
+
+        let result = filter_pytest_output(output);
+        assert!(
+            result.starts_with("Pytest: 0 passed, 0 failed, 1 error in 0.04s"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("[ERROR] collecting test_imp.py"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("ModuleNotFoundError: No module named 'nonexistent_module_xyz'"),
+            "got: {result}"
+        );
+        assert!(result.len() < output.len(), "got: {result}");
+    }
+
+    #[test]
+    fn test_filter_pytest_collection_syntax_error_keeps_location() {
+        let output = include_str!("../../../tests/fixtures/pytest_collection_syntax_error_raw.txt");
+
+        let result = filter_pytest_output(output);
+        assert!(
+            result.contains("[ERROR] collecting test_syn.py"),
+            "got: {result}"
+        );
+        assert!(result.contains("test_syn.py\", line 1"), "got: {result}");
+        assert!(result.contains("def test_x(:"), "got: {result}");
+        assert!(
+            result.contains("SyntaxError: invalid syntax"),
+            "got: {result}"
+        );
+        assert!(result.len() < output.len(), "got: {result}");
+    }
+
+    #[test]
+    fn test_filter_pytest_deep_assertion_keeps_message() {
+        let output = include_str!("../../../tests/fixtures/pytest_deep_assertion_raw.txt");
+
+        let result = filter_pytest_output(output);
+        assert!(result.contains("[FAIL] test_deep"), "got: {result}");
+        assert!(
+            result.contains("AssertionError: bad status"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("assert {'code': 500, 'body': 'err'} == {'code': 200, 'body': 'ok'}"),
+            "got: {result}"
+        );
+        assert!(result.contains("Use -v to get more diff"), "got: {result}");
+        assert!(!result.contains("Differing items"), "got: {result}");
     }
 
     #[test]
