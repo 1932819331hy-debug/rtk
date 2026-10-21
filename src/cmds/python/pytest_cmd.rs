@@ -329,6 +329,11 @@ fn build_pytest_summary(
         for (index, line) in body.iter().enumerate() {
             let show = if index < traceback_end && is_error_line(line) {
                 error_index += 1;
+                if error_index == error_head + 1 && error_tail_start > error_head {
+                    let hidden = error_tail_start - error_head;
+                    let noun = if hidden == 1 { "line" } else { "lines" };
+                    result.push_str(&format!("     … +{hidden} more E {noun}\n"));
+                }
                 error_index <= error_head || error_index > error_tail_start
             } else if Some(index) == location {
                 true
@@ -974,6 +979,7 @@ Failures:
      test_deep.py:2: in check
      E   AssertionError: bad status
      E   assert {'code': 500, 'body': 'err'} == {'code': 200, 'body': 'ok'}
+     … +2 more E lines
      E     {'body': 'err'} != {'body': 'ok'}
      E     Use -v to get more diff"#
         );
@@ -992,6 +998,7 @@ Failures:
      test_cases.py:2: in test_dict
      E   AssertionError: assert {'a': 1, 'b': 2} == {'a': 1, 'b': 3}
      E     Omitting 1 identical items, use -vv to show
+     … +1 more E line
      E     {'b': 2} != {'b': 3}
      E     Use -v to get more diff"#
         );
@@ -1009,6 +1016,7 @@ Failures:
 1. [FAIL] test_p
      E       AssertionError: state drifted
      E       assert {'b': 2} == {'b': 5}
+     … +1 more E line
      E         {'b': 2} != {'b': 5}
      E         Use -v to get more diff
      test_long.py:4: AssertionError
