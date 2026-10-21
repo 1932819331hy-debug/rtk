@@ -1,5 +1,6 @@
 //! Filters pytest output to show only failures and the summary line.
 
+use crate::core::arg_tokenizer::{Dialect, TokenKind, ValueSpec, tokenize_grammar};
 use crate::core::config;
 use crate::core::runner;
 use crate::core::shell::display_args;
@@ -53,7 +54,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     // Surface xfailed/xpassed (and their reasons) in the short summary section
     // so the compact output can report expected failures and — crucially —
     // unexpected passes (XPASS), which signal a behavior change.
-    if !has_report_flag {
+    if !has_report_flag && !hides_tracebacks(args) {
         cmd.arg("-rxX");
     }
 
@@ -339,6 +340,20 @@ fn build_pytest_summary(
     }
 
     result.trim().to_string()
+}
+
+fn hides_tracebacks(args: &[String]) -> bool {
+    let tokens = tokenize_grammar(
+        args,
+        &|kind, name| (kind == TokenKind::Long && name == "tb").then(ValueSpec::value),
+        Dialect::Posix,
+    );
+    tokens
+        .iter()
+        .filter(|t| t.kind == TokenKind::Long && t.text == "tb")
+        .filter_map(|t| t.attached.or_else(|| t.linked.map(|i| tokens[i].text)))
+        .next_back()
+        == Some("no")
 }
 
 fn is_error_line(line: &str) -> bool {
@@ -861,6 +876,44 @@ E   RuntimeError: boom at import
             "got: {result}"
         );
         assert!(result.len() < output.len(), "got: {result}");
+    }
+
+    #[test]
+    fn test_hides_tracebacks_reads_the_last_tb_value() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(hides_tracebacks(&args(&["--tb=no"])));
+        assert!(hides_tracebacks(&args(&["--tb", "no"])));
+        assert!(hides_tracebacks(&args(&["--tb=short", "-x", "--tb=no"])));
+        assert!(!hides_tracebacks(&args(&[])));
+        assert!(!hides_tracebacks(&args(&["--tb=short"])));
+        assert!(!hides_tracebacks(&args(&["--tb=line"])));
+        assert!(!hides_tracebacks(&args(&["--tb=no", "--tb=long"])));
+        assert!(!hides_tracebacks(&args(&["-k", "no"])));
+        assert!(!hides_tracebacks(&args(&["--", "--tb=no"])));
+    }
+
+    #[test]
+    fn test_filter_pytest_tb_no_keeps_short_summary_messages() {
+        let output = include_str!("../../../tests/fixtures/pytest_tb_no_raw.txt");
+
+        let result = filter_pytest_output(output);
+        assert!(
+            result.starts_with("Pytest: 1 passed, 1 failed, 1 error in 0.00s"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("[FAIL] test_tbno.py::test_bad"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("AssertionError: wrong total"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("[ERROR] test_tbno.py::test_db"),
+            "got: {result}"
+        );
+        assert!(result.contains("ConnectionError: db down"), "got: {result}");
     }
 
     #[test]

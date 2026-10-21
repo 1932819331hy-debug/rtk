@@ -1,0 +1,5 @@
+.FE                                                                      [100%]
+=========================== short test summary info ============================
+FAILED test_tbno.py::test_bad - AssertionError: wrong total
+ERROR test_tbno.py::test_db - ConnectionError: db down
+1 failed, 1 passed, 1 error in 0.00s
