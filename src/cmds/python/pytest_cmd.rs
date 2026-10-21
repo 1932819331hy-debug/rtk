@@ -38,26 +38,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         c
     };
 
-    let has_tb_flag = args.iter().any(|a| a.starts_with("--tb"));
-    let has_quiet_flag = args.iter().any(|a| a == "-q" || a == "--quiet");
-    // Only treat a short `-r…` as pytest's report flag (not `--randomly-seed` etc.)
-    let has_report_flag = args
-        .iter()
-        .any(|a| a.starts_with("-r") && !a.starts_with("--"));
-
-    if !has_tb_flag {
-        cmd.arg("--tb=short");
-    }
-    if !has_quiet_flag {
-        cmd.arg("-q");
-    }
-    // Surface xfailed/xpassed (and their reasons) in the short summary section
-    // so the compact output can report expected failures and — crucially —
-    // unexpected passes (XPASS), which signal a behavior change.
-    if !has_report_flag && !hides_tracebacks(args) {
-        cmd.arg("-rxX");
-    }
-
+    cmd.args(injected_args(args));
     for arg in args {
         cmd.arg(arg);
     }
@@ -83,6 +64,30 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         },
         runner::RunOptions::stdout_only().tee("pytest"),
     )
+}
+
+fn injected_args(args: &[String]) -> Vec<&'static str> {
+    let tb = tb_style(args);
+    let has_quiet_flag = args.iter().any(|a| a == "-q" || a == "--quiet");
+    // Only treat a short `-r…` as pytest's report flag (not `--randomly-seed` etc.)
+    let has_report_flag = args
+        .iter()
+        .any(|a| a.starts_with("-r") && !a.starts_with("--"));
+
+    let mut injected = Vec::new();
+    if tb.is_none() {
+        injected.push("--tb=short");
+    }
+    if !has_quiet_flag {
+        injected.push("-q");
+    }
+    // Surface xfailed/xpassed (and their reasons) in the short summary section
+    // so the compact output can report expected failures and — crucially —
+    // unexpected passes (XPASS), which signal a behavior change.
+    if !has_report_flag {
+        injected.push(if tb == Some("no") { "-rfExX" } else { "-rxX" });
+    }
+    injected
 }
 
 const PYTEST_NO_TESTS: &str = "Pytest: No tests collected";
@@ -114,6 +119,10 @@ pub(crate) fn filter_pytest_output(output: &str) -> String {
             && (trimmed.contains("FAILURES") || trimmed.contains("ERRORS"))
         {
             state = ParseState::Failures;
+            if !current_failure.is_empty() {
+                failures.push(current_failure.join("\n"));
+                current_failure.clear();
+            }
             continue;
         } else if trimmed.starts_with("===") && trimmed.contains("short test summary") {
             state = ParseState::Summary;
@@ -154,7 +163,7 @@ pub(crate) fn filter_pytest_output(output: &str) -> String {
                     }
                     current_failure.push(trimmed.to_string());
                 } else if !trimmed.is_empty() && !trimmed.starts_with("===") {
-                    current_failure.push(trimmed.to_string());
+                    current_failure.push(line.trim_end().to_string());
                 }
             }
             ParseState::Summary => {
@@ -294,32 +303,51 @@ fn build_pytest_summary(
         }
 
         // Show relevant error lines (assertions, errors, file locations)
-        let body = &lines[1..];
-        let error_total = body.iter().filter(|l| is_error_line(l)).count();
+        let body = match lines.first() {
+            Some(first_line) if first_line.starts_with("___") => &lines[1..],
+            _ => &lines[..],
+        };
+        let traceback_end = body
+            .iter()
+            .position(|l| is_captured_section(l))
+            .unwrap_or(body.len());
+        let traceback = &body[..traceback_end];
+        let frames_end = traceback
+            .iter()
+            .rposition(|l| is_error_line(l))
+            .map_or(traceback.len(), |last| (last + 2).min(traceback.len()));
+        let location = traceback[..frames_end]
+            .iter()
+            .rposition(|l| !is_error_line(l) && is_frame_line(l));
+        let error_total = traceback.iter().filter(|l| is_error_line(l)).count();
         let error_shown = error_total.min(MAX_ERROR_LINES);
         let error_head = error_shown / 2;
         let error_tail_start = error_total - (error_shown - error_head);
-        let mut context_left = MAX_TRACEBACK_LINES.saturating_sub(error_shown);
+        let mut context_left =
+            MAX_TRACEBACK_LINES.saturating_sub(error_shown + usize::from(location.is_some()));
         let mut error_index = 0;
-        for line in body {
-            if is_error_line(line) {
-                if error_index < error_head || error_index >= error_tail_start {
-                    result.push_str(&format!("     {}\n", truncate(line, 100)));
-                }
+        for (index, line) in body.iter().enumerate() {
+            let show = if index < traceback_end && is_error_line(line) {
                 error_index += 1;
-                continue;
-            }
-
-            let line_lower = line.to_lowercase();
-            let is_relevant = line.trim().starts_with('>')
-                || line.trim().starts_with('E')
-                || line_lower.contains("assert")
-                || line_lower.contains("error")
-                || line.contains(".py:");
-
-            if is_relevant && context_left > 0 {
-                result.push_str(&format!("     {}\n", truncate(line, 100)));
-                context_left -= 1;
+                error_index <= error_head || error_index > error_tail_start
+            } else if Some(index) == location {
+                true
+            } else {
+                let trimmed = line.trim();
+                let line_lower = line.to_lowercase();
+                let is_relevant = trimmed.starts_with('>')
+                    || trimmed.starts_with('E')
+                    || line_lower.contains("assert")
+                    || line_lower.contains("error")
+                    || line.contains(".py:");
+                let fits = is_relevant && context_left > 0;
+                if fits {
+                    context_left -= 1;
+                }
+                fits
+            };
+            if show {
+                result.push_str(&format!("     {}\n", truncate(line.trim(), 100)));
             }
         }
 
@@ -342,7 +370,7 @@ fn build_pytest_summary(
     result.trim().to_string()
 }
 
-fn hides_tracebacks(args: &[String]) -> bool {
+fn tb_style(args: &[String]) -> Option<&str> {
     let tokens = tokenize_grammar(
         args,
         &|kind, name| (kind == TokenKind::Long && name == "tb").then(ValueSpec::value),
@@ -353,11 +381,20 @@ fn hides_tracebacks(args: &[String]) -> bool {
         .filter(|t| t.kind == TokenKind::Long && t.text == "tb")
         .filter_map(|t| t.attached.or_else(|| t.linked.map(|i| tokens[i].text)))
         .next_back()
-        == Some("no")
 }
 
 fn is_error_line(line: &str) -> bool {
     line.starts_with("E ")
+}
+
+fn is_frame_line(line: &str) -> bool {
+    line.split(".py:")
+        .skip(1)
+        .any(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+fn is_captured_section(line: &str) -> bool {
+    line.starts_with("---") && line.contains(" Captured ")
 }
 
 fn parse_summary_line(summary: &str) -> PytestCounts {
@@ -879,59 +916,144 @@ E   RuntimeError: boom at import
     }
 
     #[test]
-    fn test_hides_tracebacks_reads_the_last_tb_value() {
+    fn test_injected_args_follow_the_tb_style() {
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(hides_tracebacks(&args(&["--tb=no"])));
-        assert!(hides_tracebacks(&args(&["--tb", "no"])));
-        assert!(hides_tracebacks(&args(&["--tb=short", "-x", "--tb=no"])));
-        assert!(!hides_tracebacks(&args(&[])));
-        assert!(!hides_tracebacks(&args(&["--tb=short"])));
-        assert!(!hides_tracebacks(&args(&["--tb=line"])));
-        assert!(!hides_tracebacks(&args(&["--tb=no", "--tb=long"])));
-        assert!(!hides_tracebacks(&args(&["-k", "no"])));
-        assert!(!hides_tracebacks(&args(&["--", "--tb=no"])));
+        assert_eq!(injected_args(&args(&[])), ["--tb=short", "-q", "-rxX"]);
+        assert_eq!(injected_args(&args(&["--tb=no"])), ["-q", "-rfExX"]);
+        assert_eq!(injected_args(&args(&["--tb", "no"])), ["-q", "-rfExX"]);
+        assert_eq!(
+            injected_args(&args(&["--tb=short", "-x", "--tb=no"])),
+            ["-q", "-rfExX"]
+        );
+        assert_eq!(injected_args(&args(&["--tb=line"])), ["-q", "-rxX"]);
+        assert_eq!(
+            injected_args(&args(&["--tb=no", "--tb=long"])),
+            ["-q", "-rxX"]
+        );
+        assert_eq!(
+            injected_args(&args(&["-k", "no"])),
+            ["--tb=short", "-q", "-rxX"]
+        );
+        assert_eq!(
+            injected_args(&args(&["--", "--tb=no"])),
+            ["--tb=short", "-q", "-rxX"]
+        );
+        assert_eq!(injected_args(&args(&["--tb=no", "-rA"])), ["-q"]);
     }
 
     #[test]
     fn test_filter_pytest_tb_no_keeps_short_summary_messages() {
         let output = include_str!("../../../tests/fixtures/pytest_tb_no_raw.txt");
 
-        let result = filter_pytest_output(output);
-        assert!(
-            result.starts_with("Pytest: 1 passed, 1 failed, 1 error in 0.00s"),
-            "got: {result}"
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 1 passed, 1 failed, 1 xfailed, 1 xpassed, 1 error in 0.01s
+
+Expected-failure outcomes:
+  XFAIL test_tbno.py::test_xf - ticket 7
+  XPASS test_tbno.py::test_xp - fixed upstream?
+
+Failures:
+1. [FAIL] test_tbno.py::test_bad
+     AssertionError: wrong total
+2. [ERROR] test_tbno.py::test_db
+     ConnectionError: db down"#
         );
-        assert!(
-            result.contains("[FAIL] test_tbno.py::test_bad"),
-            "got: {result}"
-        );
-        assert!(
-            result.contains("AssertionError: wrong total"),
-            "got: {result}"
-        );
-        assert!(
-            result.contains("[ERROR] test_tbno.py::test_db"),
-            "got: {result}"
-        );
-        assert!(result.contains("ConnectionError: db down"), "got: {result}");
     }
 
     #[test]
     fn test_filter_pytest_deep_assertion_keeps_message() {
         let output = include_str!("../../../tests/fixtures/pytest_deep_assertion_raw.txt");
 
-        let result = filter_pytest_output(output);
-        assert!(result.contains("[FAIL] test_deep"), "got: {result}");
-        assert!(
-            result.contains("AssertionError: bad status"),
-            "got: {result}"
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_deep
+     test_deep.py:2: in check
+     E   AssertionError: bad status
+     E   assert {'code': 500, 'body': 'err'} == {'code': 200, 'body': 'ok'}
+     E     {'body': 'err'} != {'body': 'ok'}
+     E     Use -v to get more diff"#
         );
-        assert!(
-            result.contains("assert {'code': 500, 'body': 'err'} == {'code': 200, 'body': 'ok'}"),
-            "got: {result}"
+    }
+
+    #[test]
+    fn test_filter_pytest_dict_diff_keeps_location_and_message() {
+        let output = include_str!("../../../tests/fixtures/pytest_dict_diff_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_dict
+     test_cases.py:2: in test_dict
+     E   AssertionError: assert {'a': 1, 'b': 2} == {'a': 1, 'b': 3}
+     E     Omitting 1 identical items, use -vv to show
+     E     {'b': 2} != {'b': 3}
+     E     Use -v to get more diff"#
         );
-        assert!(result.contains("Use -v to get more diff"), "got: {result}");
-        assert!(!result.contains("Differing items"), "got: {result}");
+    }
+
+    #[test]
+    fn test_filter_pytest_tb_long_reads_only_column_zero_e_lines() {
+        let output = include_str!("../../../tests/fixtures/pytest_tb_long_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 2 failed in 0.01s
+
+Failures:
+1. [FAIL] test_p
+     E       AssertionError: state drifted
+     E       assert {'b': 2} == {'b': 5}
+     E         {'b': 2} != {'b': 5}
+     E         Use -v to get more diff
+     test_long.py:4: AssertionError
+
+2. [FAIL] test_raise
+     >       raise ValueError("boom")
+     E       ValueError: boom
+     test_long.py:8: ValueError"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_warnings_summary_is_not_a_location() {
+        let output = include_str!("../../../tests/fixtures/pytest_failure_with_warning_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 1 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_total
+     test_warn.py:9: in test_total
+     E   AssertionError: totals differ
+     E   assert [0, 1, 2, 3, 4] == [1, 2, 3, 4, 5]
+     E     At index 0 diff: 0 != 1
+     E     Use -v to get more diff"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_tb_line_closes_the_error_block() {
+        let output = include_str!("../../../tests/fixtures/pytest_tb_line_setup_error_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 2 failed, 1 error in 0.01s
+
+Failures:
+1. [ERROR] at setup of test_setup_err
+     E   ConnectionError: db down
+
+     E   assert (1 + 1) == 3
+     /home/user/project/test_mixed.py:14: assert (1 + 1) == 3
+     E   AssertionError: inner mismatch"#
+        );
     }
 
     #[test]
