@@ -3562,7 +3562,10 @@ fn run_cli() -> Result<i32> {
             }
         }
 
-        Commands::Ruff { args } => ruff_cmd::run(&args, cli.verbose)?,
+        Commands::Ruff { args } => {
+            let args = core::args_utils::restore_double_dash(&args);
+            ruff_cmd::run(&args, cli.verbose)?
+        }
 
         Commands::Sqlfluff { args } => sqlfluff_cmd::run(&args, cli.verbose)?,
 
@@ -5906,6 +5909,23 @@ mod tests {
         // test pins the premise that helper depends on.
         let (_, _, _, extra_args) = parse_grep(&["rtk", "grep", "--", "-v", "file"]).unwrap();
         assert_eq!(extra_args, vec!["-v", "file"], "clap must consume the --");
+    }
+
+    #[test]
+    fn test_ruff_double_dash_restored_for_subcommand_named_file() {
+        // Clap consumes the leading delimiter, but it is semantically necessary:
+        // "check" is a filename, not the explicit Ruff subcommand.
+        let raw = ["rtk", "ruff", "--", "check"];
+        let parsed = try_parse_cli_from(raw).expect("parse ruff arguments");
+        let Commands::Ruff { args } = parsed.command else {
+            panic!("expected ruff command");
+        };
+        assert_eq!(args, vec!["check"]);
+        let raw: Vec<String> = raw.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            core::args_utils::restore_double_dash_with_raw(&args, &raw),
+            vec!["--", "check"]
+        );
     }
 
     #[test]
