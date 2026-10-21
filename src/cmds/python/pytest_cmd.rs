@@ -38,13 +38,14 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         c
     };
 
-    cmd.args(injected_args(args));
+    let injected = injected_args(args);
+    cmd.args(&injected);
     for arg in args {
         cmd.arg(arg);
     }
 
     if verbose > 0 {
-        eprintln!("Running: pytest --tb=short -q {}", args.join(" "));
+        eprintln!("Running: pytest {} {}", injected.join(" "), args.join(" "));
     }
 
     runner::run_filtered_with_exit(
@@ -155,7 +156,15 @@ pub(crate) fn filter_pytest_output(output: &str) -> String {
             }
             ParseState::Failures => {
                 // Collect failure details
-                if trimmed.starts_with("___") {
+                if trimmed.starts_with("===")
+                    && trimmed.trim_matches('=').trim() == "warnings summary"
+                {
+                    if !current_failure.is_empty() {
+                        failures.push(current_failure.join("\n"));
+                        current_failure.clear();
+                    }
+                    state = ParseState::TestProgress;
+                } else if trimmed.starts_with("___") {
                     // New failure section
                     if !current_failure.is_empty() {
                         failures.push(current_failure.join("\n"));
@@ -312,11 +321,7 @@ fn build_pytest_summary(
             .position(|l| is_captured_section(l))
             .unwrap_or(body.len());
         let traceback = &body[..traceback_end];
-        let frames_end = traceback
-            .iter()
-            .rposition(|l| is_error_line(l))
-            .map_or(traceback.len(), |last| (last + 2).min(traceback.len()));
-        let location = traceback[..frames_end]
+        let location = traceback
             .iter()
             .rposition(|l| !is_error_line(l) && is_frame_line(l));
         let error_total = traceback.iter().filter(|l| is_error_line(l)).count();
@@ -1047,6 +1052,87 @@ Failures:
     }
 
     #[test]
+    fn test_filter_pytest_config_warning_is_not_a_location() {
+        let output = include_str!("../../../tests/fixtures/pytest_config_warning_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_bad
+     test_w.py:6: in test_bad
+     E   AssertionError: assert 1 == 2
+     E    +  where 1 = helper({'k': 1})"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_location_is_not_an_e_line() {
+        let output = include_str!("../../../tests/fixtures/pytest_lint_location_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_lint
+     test_lint.py:6: in test_lint
+     E   AssertionError: assert ['foo.py:3: E...ine too long'] == []
+     E     Left contains one more item: 'foo.py:3: E501 line too long'
+     E     Use -v to get more diff"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_captured_e_line_is_not_an_error_line() {
+        let output = include_str!("../../../tests/fixtures/pytest_captured_e_line_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_noisy
+     test_cap.py:3: in test_noisy
+     E   AssertionError: Captured total mismatch
+     E   assert 1 == 2"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_tb_long_locals_keeps_the_failing_frame() {
+        let output = include_str!("../../../tests/fixtures/pytest_tb_long_locals_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_loc
+     >       check(seen)
+     E       assert 2 == 3
+     test_loc.py:3: AssertionError"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_missing_fixture_keeps_location() {
+        let output = include_str!("../../../tests/fixtures/pytest_missing_fixture_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 0 failed, 1 error in 0.01s
+
+Failures:
+1. [ERROR] at setup of test_fx
+     E       fixture 'missing_fixture' not found
+     >       available fixtures: capfd, capfdbinary, caplog, capsys, capsysbinary, capteesys, doctest_...
+     /home/user/project/test_fx.py:1"#
+        );
+    }
+
+    #[test]
     fn test_filter_pytest_tb_line_closes_the_error_block() {
         let output = include_str!("../../../tests/fixtures/pytest_tb_line_setup_error_raw.txt");
 
@@ -1059,8 +1145,8 @@ Failures:
      E   ConnectionError: db down
 
      E   assert (1 + 1) == 3
-     /home/user/project/test_mixed.py:14: assert (1 + 1) == 3
-     E   AssertionError: inner mismatch"#
+     E   AssertionError: inner mismatch
+     /home/user/project/test_mixed.py:18: AssertionError: inner mismatch"#
         );
     }
 
