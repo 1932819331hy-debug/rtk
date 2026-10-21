@@ -93,6 +93,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
             .iter()
             .skip(start_idx)
             .all(|a| a.starts_with('-') || a.contains('='))
+            && !args.iter().any(|a| a == "--")
         {
             cmd.arg(".");
         }
@@ -137,7 +138,7 @@ fn filter_passthrough_output(stdout: &str, is_analyze_graph: bool) -> String {
 
 fn is_check_invocation(args: &[String]) -> bool {
     args.first().is_none_or(|arg| {
-        arg == "check" || (!arg.starts_with('-') && !RUFF_SUBCOMMANDS.contains(&arg.as_str()))
+        arg == "check" || arg == "--" || (!arg.starts_with('-') && !RUFF_SUBCOMMANDS.contains(&arg.as_str()))
     })
 }
 
@@ -461,6 +462,17 @@ mod tests {
         assert!(is_check_invocation(&["check".to_string(), ".".to_string()]));
         assert!(is_check_invocation(&["src".to_string()]));
         assert!(is_check_invocation(&["pyproject.toml".to_string()]));
+    }
+
+    #[test]
+    fn leading_double_dash_always_marks_implicit_check_paths() {
+        for path in ["check", "format", "version", "--help", "module.py"] {
+            assert!(
+                is_check_invocation(&["--".to_string(), path.to_string()]),
+                "path named {path} must route to ruff check"
+            );
+        }
+        assert!(!is_check_invocation(&["--help".to_string()]));
     }
 
     #[test]
