@@ -182,7 +182,7 @@ pub(crate) fn filter_pytest_output(output: &str) -> String {
                         current_failure.clear();
                     }
                     state = ParseState::TestProgress;
-                } else if trimmed.starts_with("___") {
+                } else if is_block_header(trimmed) {
                     // New failure section
                     if !current_failure.is_empty() {
                         failures.push(current_failure.join("\n"));
@@ -304,7 +304,7 @@ fn build_pytest_summary(
 
         // First line is usually test name (after ___)
         if let Some(first_line) = lines.first() {
-            if first_line.starts_with("___") {
+            if is_block_header(first_line) {
                 // Extract test name between ___
                 let test_name = first_line.trim_matches('_').trim();
                 // ERRORS section headers read "ERROR at setup of test_x" / "ERROR collecting x.py"
@@ -331,7 +331,7 @@ fn build_pytest_summary(
 
         // Show relevant error lines (assertions, errors, file locations)
         let (body, collecting) = match lines.first() {
-            Some(first_line) if first_line.starts_with("___") => {
+            Some(first_line) if is_block_header(first_line) => {
                 (&lines[1..], first_line.contains(" ERROR collecting "))
             }
             _ => (&lines[..], false),
@@ -410,10 +410,23 @@ fn is_error_line(line: &str) -> bool {
         .is_some_and(|rest| !rest.trim_start().starts_with("= "))
 }
 
+fn is_block_header(line: &str) -> bool {
+    line.starts_with('_')
+        && line.ends_with('_')
+        && line
+            .trim_matches('_')
+            .chars()
+            .any(|c| c != '_' && !c.is_whitespace())
+}
+
 fn frame_file(line: &str) -> Option<&str> {
+    if line.starts_with(|c: char| c.is_whitespace() || c == '>') {
+        return None;
+    }
     line.match_indices(".py:")
         .find(|(at, _)| line[at + 4..].starts_with(|c: char| c.is_ascii_digit()))
         .map(|(at, _)| &line[..at + 3])
+        .filter(|file| !file.contains(['\'', '"']))
 }
 
 fn is_captured_section(line: &str) -> bool {
@@ -1403,6 +1416,143 @@ Failures:
      E   assert 1 == 2
      E   AssertionError: assert ['foo.py:3: E...ine too long'] == []
      /home/user/project/test_tl.py:10: AssertionError: assert ['foo.py:3: E...ine too long'] == []"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_shortened_header_starts_a_block() {
+        let output = include_str!("../../../tests/fixtures/pytest_long_param_id_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 2 failed in 0.01s
+
+Failures:
+1. [FAIL] test_first
+     test_lm.py:5: in test_first
+     E   AssertionError: first test message
+     E   assert {'a': 1, 'b': 2} == {'a': 1, 'b': 3}
+     … +2 more E lines
+     E     {'b': 2} != {'b': 3}
+     E     Use -v to get more diff
+
+2. [FAIL] test_second_with_a_long_parametrized_id[xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+     test_lm.py:10: in test_second_with_a_long_parametrized_id
+     E   RuntimeError: second test message
+     E   second detail one
+     E   second detail two"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_source_line_is_never_a_frame() {
+        let output =
+            include_str!("../../../tests/fixtures/pytest_source_line_with_location_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_b
+     test_sl.py:5: in test_b
+     helpers.py:2: in boom
+     E   RuntimeError: see app.py:12 for details
+     E   second line
+     E   third line"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_tb_long_source_and_args_are_never_frames() {
+        let output = include_str!(
+            "../../../tests/fixtures/pytest_tb_long_source_line_with_location_raw.txt"
+        );
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_load
+     test_sr.py:6:
+     E       ValueError: bad config
+     E       line two
+     E       line three
+     mylib/conf.py:2: ValueError"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_locals_are_never_frames() {
+        let output =
+            include_str!("../../../tests/fixtures/pytest_tb_long_locals_with_location_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_load
+     test_sr.py:6:
+     E       ValueError: bad config
+     E       line two
+     E       line three
+     mylib/conf.py:2: ValueError"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_test_named_collecting_keeps_the_test_frame() {
+        let output = include_str!("../../../tests/fixtures/pytest_test_named_collecting_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_collecting_metrics
+     test_metrics.py:5: in test_collecting_metrics
+     mylib/metrics.py:3: in collect
+     E   ValueError: no samples
+     E   source: metrics
+     E   window: 5m"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_source_comment_is_never_a_frame() {
+        let output = include_str!("../../../tests/fixtures/pytest_tb_short_source_comment_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_comment
+     test_cm.py:7: in test_comment
+     mylib/conf.py:2: in fail
+     E   ValueError: bad config
+     E   line two
+     E   line three"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_tb_long_source_comment_is_never_a_frame() {
+        let output = include_str!("../../../tests/fixtures/pytest_tb_long_source_comment_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_comment
+     test_cm.py:7:
+     E       ValueError: bad config
+     E       line two
+     E       line three
+     mylib/conf.py:2: ValueError"#
         );
     }
 
