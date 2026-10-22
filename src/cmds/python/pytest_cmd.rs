@@ -68,12 +68,30 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 fn injected_args(args: &[String]) -> Vec<&'static str> {
-    let tb = tb_style(args);
-    let has_quiet_flag = args.iter().any(|a| a == "-q" || a == "--quiet");
-    // Only treat a short `-r…` as pytest's report flag (not `--randomly-seed` etc.)
-    let has_report_flag = args
+    let tokens = tokenize_grammar(
+        args,
+        &|kind, name| match (kind, name) {
+            (TokenKind::Long, "tb")
+            | (TokenKind::Short, "k" | "m" | "p" | "c" | "o" | "W" | "r") => {
+                Some(ValueSpec::value())
+            }
+            _ => None,
+        },
+        Dialect::Posix,
+    );
+    let tb = tokens
         .iter()
-        .any(|a| a.starts_with("-r") && !a.starts_with("--"));
+        .filter(|t| t.kind == TokenKind::Long && t.text == "tb")
+        .filter_map(|t| t.value(&tokens))
+        .next_back();
+    let has_flag = |short: &str, long: &str| {
+        tokens.iter().any(|t| {
+            (t.kind == TokenKind::Short && t.text == short)
+                || (t.kind == TokenKind::Long && t.text == long)
+        })
+    };
+    let has_quiet_flag = has_flag("q", "quiet");
+    let has_report_flag = has_flag("r", "report-chars");
 
     let mut injected = Vec::new();
     if tb.is_none() {
@@ -312,24 +330,31 @@ fn build_pytest_summary(
         }
 
         // Show relevant error lines (assertions, errors, file locations)
-        let body = match lines.first() {
-            Some(first_line) if first_line.starts_with("___") => &lines[1..],
-            _ => &lines[..],
+        let (body, collecting) = match lines.first() {
+            Some(first_line) if first_line.starts_with("___") => {
+                (&lines[1..], first_line.contains(" ERROR collecting "))
+            }
+            _ => (&lines[..], false),
         };
         let traceback_end = body
             .iter()
             .position(|l| is_captured_section(l))
             .unwrap_or(body.len());
         let traceback = &body[..traceback_end];
-        let location = traceback
+        let frame = |l: &&str| !is_error_line(l) && frame_file(l).is_some();
+        let location = traceback.iter().rposition(frame);
+        let location_file = location.and_then(|at| frame_file(traceback[at]));
+        let anchor = traceback
             .iter()
-            .rposition(|l| !is_error_line(l) && is_frame_line(l));
+            .position(frame)
+            .filter(|&at| !collecting && frame_file(traceback[at]) != location_file);
         let error_total = traceback.iter().filter(|l| is_error_line(l)).count();
         let error_shown = error_total.min(MAX_ERROR_LINES);
         let error_head = error_shown / 2;
         let error_tail_start = error_total - (error_shown - error_head);
-        let mut context_left =
-            MAX_TRACEBACK_LINES.saturating_sub(error_shown + usize::from(location.is_some()));
+        let mut context_left = MAX_TRACEBACK_LINES.saturating_sub(
+            error_shown + usize::from(location.is_some()) + usize::from(anchor.is_some()),
+        );
         let mut error_index = 0;
         for (index, line) in body.iter().enumerate() {
             let show = if index < traceback_end && is_error_line(line) {
@@ -340,7 +365,7 @@ fn build_pytest_summary(
                     result.push_str(&format!("     … +{hidden} more E {noun}\n"));
                 }
                 error_index <= error_head || error_index > error_tail_start
-            } else if Some(index) == location {
+            } else if Some(index) == location || Some(index) == anchor {
                 true
             } else {
                 let trimmed = line.trim();
@@ -380,27 +405,15 @@ fn build_pytest_summary(
     result.trim().to_string()
 }
 
-fn tb_style(args: &[String]) -> Option<&str> {
-    let tokens = tokenize_grammar(
-        args,
-        &|kind, name| (kind == TokenKind::Long && name == "tb").then(ValueSpec::value),
-        Dialect::Posix,
-    );
-    tokens
-        .iter()
-        .filter(|t| t.kind == TokenKind::Long && t.text == "tb")
-        .filter_map(|t| t.attached.or_else(|| t.linked.map(|i| tokens[i].text)))
-        .next_back()
-}
-
 fn is_error_line(line: &str) -> bool {
-    line.starts_with("E ")
+    line.strip_prefix("E ")
+        .is_some_and(|rest| !rest.trim_start().starts_with("= "))
 }
 
-fn is_frame_line(line: &str) -> bool {
-    line.split(".py:")
-        .skip(1)
-        .any(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+fn frame_file(line: &str) -> Option<&str> {
+    line.match_indices(".py:")
+        .find(|(at, _)| line[at + 4..].starts_with(|c: char| c.is_ascii_digit()))
+        .map(|(at, _)| &line[..at + 3])
 }
 
 fn is_captured_section(line: &str) -> bool {
@@ -891,38 +904,34 @@ E   RuntimeError: boom at import
     fn test_filter_pytest_collection_import_error_keeps_message() {
         let output = include_str!("../../../tests/fixtures/pytest_collection_import_error_raw.txt");
 
-        let result = filter_pytest_output(output);
-        assert!(
-            result.starts_with("Pytest: 0 passed, 0 failed, 1 error in 0.04s"),
-            "got: {result}"
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 0 failed, 1 error in 0.04s
+
+Failures:
+1. [ERROR] collecting test_imp.py
+     ImportError while importing test module '/home/user/project/test_imp.py'.
+     test_imp.py:1: in <module>
+     E   ModuleNotFoundError: No module named 'nonexistent_module_xyz'"#
         );
-        assert!(
-            result.contains("[ERROR] collecting test_imp.py"),
-            "got: {result}"
-        );
-        assert!(
-            result.contains("ModuleNotFoundError: No module named 'nonexistent_module_xyz'"),
-            "got: {result}"
-        );
-        assert!(result.len() < output.len(), "got: {result}");
     }
 
     #[test]
     fn test_filter_pytest_collection_syntax_error_keeps_location() {
         let output = include_str!("../../../tests/fixtures/pytest_collection_syntax_error_raw.txt");
 
-        let result = filter_pytest_output(output);
-        assert!(
-            result.contains("[ERROR] collecting test_syn.py"),
-            "got: {result}"
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 0 failed, 1 error in 0.08s
+
+Failures:
+1. [ERROR] collecting test_syn.py
+     /usr/lib/python3.13/ast.py:50: in parse
+     E     File "/home/user/project/test_syn.py", line 1
+     E       def test_x(:
+     E                  ^
+     E   SyntaxError: invalid syntax"#
         );
-        assert!(result.contains("test_syn.py\", line 1"), "got: {result}");
-        assert!(result.contains("def test_x(:"), "got: {result}");
-        assert!(
-            result.contains("SyntaxError: invalid syntax"),
-            "got: {result}"
-        );
-        assert!(result.len() < output.len(), "got: {result}");
     }
 
     #[test]
@@ -949,6 +958,41 @@ E   RuntimeError: boom at import
             ["--tb=short", "-q", "-rxX"]
         );
         assert_eq!(injected_args(&args(&["--tb=no", "-rA"])), ["-q"]);
+        assert_eq!(injected_args(&args(&["--tb=no", "-qx"])), ["-rfExX"]);
+        assert_eq!(injected_args(&args(&["-xq"])), ["--tb=short", "-rxX"]);
+        assert_eq!(injected_args(&args(&["--quiet"])), ["--tb=short", "-rxX"]);
+        assert_eq!(injected_args(&args(&["-xrfE"])), ["--tb=short", "-q"]);
+        assert_eq!(injected_args(&args(&["-r", "fE"])), ["--tb=short", "-q"]);
+        assert_eq!(
+            injected_args(&args(&["--report-chars=fE"])),
+            ["--tb=short", "-q"]
+        );
+        assert_eq!(
+            injected_args(&args(&["-pno:cacheprovider"])),
+            ["--tb=short", "-q", "-rxX"]
+        );
+        for value_flag in [
+            "-ktest_query",
+            "-mquick",
+            "-prerunfailures",
+            "-Werror",
+            "-cqa.ini",
+            "-orequired_plugins=x",
+        ] {
+            assert_eq!(
+                injected_args(&args(&[value_flag])),
+                ["--tb=short", "-q", "-rxX"]
+            );
+        }
+        assert_eq!(injected_args(&args(&["-rfEq"])), ["--tb=short", "-q"]);
+        assert_eq!(
+            injected_args(&args(&["q", "r"])),
+            ["--tb=short", "-q", "-rxX"]
+        );
+        assert_eq!(
+            injected_args(&args(&["--", "-q"])),
+            ["--tb=short", "-q", "-rxX"]
+        );
     }
 
     #[test]
@@ -1129,6 +1173,236 @@ Failures:
      E       fixture 'missing_fixture' not found
      >       available fixtures: capfd, capfdbinary, caplog, capsys, capsysbinary, capteesys, doctest_...
      /home/user/project/test_fx.py:1"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_helper_module_keeps_the_test_frame() {
+        let output = include_str!("../../../tests/fixtures/pytest_helper_module_raise_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.02s
+
+Failures:
+1. [FAIL] test_frames
+     test_lib.py:5: in test_frames
+     mylib/checks.py:3: in assert_frame_equal
+     E   AssertionError: DataFrame are different
+     E   DataFrame shape mismatch
+     E   [left]:  (3, 2)
+     E   [right]: (3, 4)"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_tb_long_helper_module_keeps_the_test_frame() {
+        let output = include_str!("../../../tests/fixtures/pytest_tb_long_helper_module_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_get
+     test_key.py:5:
+     E       KeyError: 'b'
+     mylib/store.py:2: KeyError"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_locals_named_e_are_not_error_lines() {
+        let output = include_str!("../../../tests/fixtures/pytest_tb_long_locals_named_e_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.02s
+
+Failures:
+1. [FAIL] test_p
+     E       AssertionError: state drifted
+     E       assert {'b': 2} == {'b': 5}
+     … +1 more E line
+     E         {'b': 2} != {'b': 5}
+     E         Use -v to get more diff
+     test_le.py:4: AssertionError"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_every_captured_section_is_cut() {
+        let output = include_str!("../../../tests/fixtures/pytest_two_captured_sections_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.02s
+
+Failures:
+1. [FAIL] test_two
+     test_tc.py:9: in test_two
+     E   AssertionError: two captured sections
+     E   assert 0"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_captured_e_lines_do_not_count_against_the_diff() {
+        let output = include_str!("../../../tests/fixtures/pytest_captured_dict_diff_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_td
+     test_td.py:7: in test_td
+     E   AssertionError: assert {'a': 1, 'b': 2} == {'a': 1, 'b': 3}
+     E     Omitting 1 identical items, use -vv to show
+     … +1 more E line
+     E     {'b': 2} != {'b': 3}
+     E     Use -v to get more diff"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_durations_are_not_a_location() {
+        let output = include_str!("../../../tests/fixtures/pytest_durations_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 1 passed, 1 failed in 0.05s
+
+Failures:
+1. [FAIL] test_slow
+     test_du.py:6: in test_slow
+     E   AssertionError: slow fail
+     E   assert 1 == 2"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_tb_native_fills_context_lines() {
+        let output = include_str!("../../../tests/fixtures/pytest_tb_native_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 2 failed, 1 error in 0.01s
+
+Failures:
+1. [ERROR] at setup of test_setup
+     raise ConnectionError('db down')
+     ConnectionError: db down
+
+2. [FAIL] test_a
+     assert 1 + 1 == 3
+     AssertionError: assert (1 + 1) == 3
+
+3. [FAIL] test_b
+     assert 'a' == 'b', 'inner mismatch'
+     AssertionError: inner mismatch
+     assert 'a' == 'b'"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_single_e_raise_keeps_the_source_line() {
+        let output = include_str!("../../../tests/fixtures/pytest_single_e_raise_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_raise
+     test_r.py:2: in test_raise
+     raise ValueError("boom")
+     E   ValueError: boom"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_indented_e_source_is_not_an_error_line() {
+        let output =
+            include_str!("../../../tests/fixtures/pytest_tb_long_indented_e_source_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_q
+     E       AssertionError: list drifted
+     E       assert [1, 2] == [3]
+     … +1 more E line
+     E         Left contains one more item: 2
+     E         Use -v to get more diff
+     test_ep.py:4: AssertionError"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_error_line_is_never_the_location() {
+        let output = include_str!("../../../tests/fixtures/pytest_helper_module_lint_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_l
+     test_hl.py:5: in test_l
+     mylib/lint.py:3: in check
+     E   AssertionError: ['foo.py:3: E501 line too long']"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_setup_error_keeps_the_fixture_frame() {
+        let output = include_str!("../../../tests/fixtures/pytest_conftest_setup_error_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 0 failed, 1 error in 0.01s
+
+Failures:
+1. [ERROR] at setup of test_uses_db
+     conftest.py:7: in db
+     mylib/db.py:2: in connect
+     E   ConnectionError: db down
+     E   retry in 5s
+     E   host: db.internal"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_tb_native_ignores_captured_log_frames() {
+        let output = include_str!("../../../tests/fixtures/pytest_tb_native_captured_log_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_logged
+     assert 0, "native failure"
+     AssertionError: native failure
+     assert 0"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_tb_line_compares_frame_files() {
+        let output = include_str!("../../../tests/fixtures/pytest_tb_line_two_locations_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 2 failed in 0.01s
+
+Failures:
+     E   assert 1 == 2
+     E   AssertionError: assert ['foo.py:3: E...ine too long'] == []
+     /home/user/project/test_tl.py:10: AssertionError: assert ['foo.py:3: E...ine too long'] == []"#
         );
     }
 
