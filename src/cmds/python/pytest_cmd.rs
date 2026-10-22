@@ -411,12 +411,10 @@ fn is_error_line(line: &str) -> bool {
 }
 
 fn is_block_header(line: &str) -> bool {
-    line.starts_with('_')
-        && line.ends_with('_')
-        && line
-            .trim_matches('_')
-            .chars()
-            .any(|c| c != '_' && !c.is_whitespace())
+    line.trim_start_matches('_')
+        .strip_prefix(' ')
+        .and_then(|rest| rest.trim_end_matches('_').strip_suffix(' '))
+        .is_some_and(|title| title.chars().any(|c| c != '_' && !c.is_whitespace()))
 }
 
 fn frame_file(line: &str) -> Option<&str> {
@@ -426,7 +424,7 @@ fn frame_file(line: &str) -> Option<&str> {
     line.match_indices(".py:")
         .find(|(at, _)| line[at + 4..].starts_with(|c: char| c.is_ascii_digit()))
         .map(|(at, _)| &line[..at + 3])
-        .filter(|file| !file.contains(['\'', '"']))
+        .filter(|file| !file.contains(" = "))
 }
 
 fn is_captured_section(line: &str) -> bool {
@@ -1530,7 +1528,7 @@ Failures:
 
 Failures:
 1. [FAIL] test_comment
-     test_cm.py:7: in test_comment
+     test_cm.py:10: in test_comment
      mylib/conf.py:2: in fail
      E   ValueError: bad config
      E   line two
@@ -1548,11 +1546,73 @@ Failures:
 
 Failures:
 1. [FAIL] test_comment
-     test_cm.py:7:
+     test_cm.py:10:
      E       ValueError: bad config
      E       line two
      E       line three
      mylib/conf.py:2: ValueError"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_captured_underscore_lines_are_not_headers() {
+        let output =
+            include_str!("../../../tests/fixtures/pytest_captured_underscore_lines_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 2 failed in 0.01s
+
+Failures:
+1. [FAIL] test_dunder
+     test_du5.py:7: in test_dunder
+     E   AssertionError: dunder fail
+     E   assert {'a': 1} == {'a': 2}
+     … +1 more E line
+     E     {'a': 1} != {'a': 2}
+     E     Use -v to get more diff
+
+2. [FAIL] test_after
+     test_du5.py:11: in test_after
+     E   AssertionError: after dunder
+     E   assert 0"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_locals_repr_is_never_a_frame() {
+        let output =
+            include_str!("../../../tests/fixtures/pytest_tb_long_locals_frame_repr_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_loc
+     E       ValueError: helper boom
+     E       l2
+     E       l3
+     test_dlo.py:7: ValueError"#
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_dir_with_spaces_keeps_location() {
+        let output = include_str!("../../../tests/fixtures/pytest_dir_with_spaces_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_sp
+     bob's dir/test_sp.py:2: in test_sp
+     E   AssertionError: spaced dir
+     E   assert {'a': 1} == {'a': 2}
+     … +1 more E line
+     E     {'a': 1} != {'a': 2}
+     E     Use -v to get more diff"#
         );
     }
 

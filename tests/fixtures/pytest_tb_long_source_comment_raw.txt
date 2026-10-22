@@ -3,12 +3,11 @@ F                                                                        [100%]
 _________________________________ test_comment _________________________________
 
     def test_comment():
-        marker = 1  # see app.py:12
-        print("_cache warm", marker)
+        warm()  # see app.py:12
 >       fail()  # see app.py:12
         ^^^^^^
 
-test_cm.py:7: 
+test_cm.py:10: 
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
 
     def fail():
@@ -19,5 +18,5 @@ E       line three
 
 mylib/conf.py:2: ValueError
 ----------------------------- Captured stdout call -----------------------------
-_cache warm 1
+_cache warm
 1 failed in 0.01s
