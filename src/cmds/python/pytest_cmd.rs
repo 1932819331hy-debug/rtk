@@ -1242,6 +1242,25 @@ Failures:
     }
 
     #[test]
+    fn test_filter_pytest_equals_run_diff_line_is_an_error_line() {
+        let output = include_str!("../../../tests/fixtures/pytest_rst_heading_diff_raw.txt");
+
+        assert_eq!(
+            filter_pytest_output(output),
+            r#"Pytest: 0 passed, 1 failed in 0.01s
+
+Failures:
+1. [FAIL] test_rst
+     test_rst.py:2: in test_rst
+     E   AssertionError: assert '=====\nbody a\n' == '=====\nbody b\n'
+     E       =====
+     … +2 more E lines
+     E     + body a
+     E     ?      ^"#
+        );
+    }
+
+    #[test]
     fn test_filter_pytest_every_captured_section_is_cut() {
         let output = include_str!("../../../tests/fixtures/pytest_two_captured_sections_raw.txt");
 
