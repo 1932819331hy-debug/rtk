@@ -2156,6 +2156,34 @@ mod tests {
     }
 
     #[test]
+    fn test_hook_status_binary_hook_with_leftover_script_is_outdated() {
+        let tmp = test_isolation::tempdir();
+        with_claude_dir_override(&tmp, |claude_dir| {
+            let hooks_dir = claude_dir.join(HOOKS_SUBDIR);
+            fs::create_dir_all(&hooks_dir).expect("create hooks dir");
+            fs::write(
+                hooks_dir.join(REWRITE_HOOK_FILE),
+                format!(
+                    "#!/usr/bin/env bash\n# rtk-hook-version: {}\n",
+                    crate::hooks::hook_check::CURRENT_HOOK_VERSION
+                ),
+            )
+            .expect("write leftover script");
+            fs::write(
+                claude_dir.join(SETTINGS_JSON),
+                r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]}]}}"#,
+            )
+            .expect("write settings");
+
+            assert_eq!(
+                hook_status(),
+                crate::hooks::hook_check::HookStatus::Outdated,
+                "a leftover legacy script next to the binary hook means migration is unfinished"
+            );
+        });
+    }
+
+    #[test]
     fn test_hook_status_v4_script_in_settings_is_ok() {
         let tmp = test_isolation::tempdir();
         with_claude_dir_override(&tmp, |claude_dir| {

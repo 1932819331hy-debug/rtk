@@ -130,15 +130,15 @@ fn test_daily_check_opencode_plugin_silences_and_removal_warns() {
         "Expected daily check to warn without OpenCode plugin. Got:\n{ls_stderr_before}"
     );
 
-    // Install OpenCode plugin at both Linux XDG and macOS fallback paths so test passes on all Unix
-    let xdg_plugin_dir = home.path().join(".config/opencode/plugins");
-    fs::create_dir_all(&xdg_plugin_dir).expect("create opencode plugins dir");
-    let xdg_plugin = xdg_plugin_dir.join("rtk.ts");
-    fs::write(&xdg_plugin, b"export default {}").expect("write rtk.ts");
+    // Install the OpenCode plugin where `rtk init -g --opencode` writes it
+    let plugin_dir = home.path().join(".config/opencode/plugins");
+    fs::create_dir_all(&plugin_dir).expect("create opencode plugins dir");
+    let plugin_file = plugin_dir.join("rtk.ts");
+    fs::write(&plugin_file, b"export default {}").expect("write rtk.ts");
 
     assert_silent_in_gain_and_daily_check(ws.path(), home.path(), "OpenCode plugin installed");
 
-    fs::remove_file(&xdg_plugin).expect("remove rtk.ts");
+    fs::remove_file(&plugin_file).expect("remove rtk.ts");
     assert_warns_in_gain_and_daily_check(ws.path(), home.path(), "OpenCode plugin removed");
 }
 

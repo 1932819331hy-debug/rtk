@@ -571,8 +571,9 @@ fn print_pipeline_row(label: &str, activity: String, saved: i64, pct: f64) {
 /// Reports a missing or outdated hook on stderr.
 ///
 /// `suppress_hook_warning` hides the missing-hook arm: a user who runs rtk
-/// without hooks on purpose reads this report most often. The outdated-hook
-/// arm stays visible either way.
+/// without hooks on purpose reads this report most often. An rtk hook or plugin
+/// that `hook_check::is_any_agent_configured` finds for another agent hides it
+/// too. The outdated-hook arm stays visible either way.
 fn warn_hook_issues() {
     match hook_check::status() {
         hook_check::HookStatus::Missing

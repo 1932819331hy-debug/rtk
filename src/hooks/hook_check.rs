@@ -215,6 +215,40 @@ mod tests {
     }
 
     #[test]
+    fn test_probes_ignore_foreign_hooks_in_agent_files() {
+        let tmp = test_isolation::tempdir();
+        let home = tmp.path().join("home");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(home.join(".gemini")).expect("create .gemini");
+        std::fs::create_dir_all(home.join(".vibe")).expect("create .vibe");
+        std::fs::create_dir_all(&ws).expect("create ws");
+
+        test_isolation::with_root(&home, || {
+            let _entered = test_isolation::enter(&ws);
+            std::fs::write(
+                home.join(".gemini/settings.json"),
+                r#"{"hooks":{"BeforeTool":[{"matcher":"run_shell_command","hooks":[{"type":"command","command":"/usr/local/bin/audit-shell"}]}]}}"#,
+            )
+            .expect("write gemini settings");
+            std::fs::write(
+                home.join(".vibe/hooks.toml"),
+                "[[hooks]]\nname = \"audit\"\ntype = \"pre_tool\"\nmatch = \"bash\"\ncommand = \"rtk-audit\"\n",
+            )
+            .expect("write vibe hooks");
+
+            assert!(
+                !super::super::init::gemini::is_configured(),
+                "a non-rtk BeforeTool hook is not an rtk install"
+            );
+            assert!(
+                !super::super::init::vibe::is_configured(),
+                "a Vibe hook not named rtk-rewrite is not an rtk install"
+            );
+            assert!(!is_any_agent_configured(), "no agent is configured");
+        });
+    }
+
+    #[test]
     fn test_check_and_warn_suppressed_when_agent_configured() {
         let tmp = test_isolation::tempdir();
         let home = tmp.path().join("home");
