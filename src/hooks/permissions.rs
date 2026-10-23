@@ -74,11 +74,119 @@ pub fn check_command_for_agent(cmd: &str, host: Host, agent: Option<&str>) -> Pe
     )
 }
 
+/// Whether RTK can show that nothing it is about to wrap could escape a deny
+/// rule.
+///
+/// The fish wrap hands a script to a *different* shell, where RTK's own
+/// segmenters cannot say which commands run — fish starts one in places bash
+/// has no grammar for, and resolves words at run time. It also puts *every*
+/// command of the script inside one quoted argument, which is what makes it
+/// different from an ordinary rewrite: a host's own rule on a command RTK
+/// never rewrites still fires today, and would not fire on the wrapped form.
+///
+/// So the wrap is offered on one host only, Claude Code's own hook: RTK reads
+/// its settings files, and the hook asks explicitly for every wrap it builds, so no
+/// allow rule matching `rtk` can run the script unprompted. See
+/// [`claude_hook_deny_rules`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenyRules {
+    /// Every settings file RTK reads parsed, and none carries a deny rule.
+    NoneConfigured,
+    /// Anything else: a deny rule is present, a file could not be parsed, the
+    /// wrap is off, the command is not provably fish, or this caller is not
+    /// the Claude hook.
+    Unattested,
+}
+
+impl DenyRules {
+    /// True only for [`DenyRules::NoneConfigured`].
+    pub(crate) fn permit_wrap(self) -> bool {
+        self == Self::NoneConfigured
+    }
+}
+
+/// What RTK can say about the deny rules in force for `rtk hook claude`.
+///
+/// The settings files [`load_permission_rules`] reads are the rules RTK can
+/// see, not all of Claude Code's: `--settings`, `--disallowedTools`, managed
+/// settings and the project the agent has `cd`'d away from never reach the
+/// hook, which is why every wrap is also an explicit ask. Within what RTK can
+/// see, an empty deny list is evidence only when RTK read and parsed every
+/// one of those files. A file it had to skip may name the rule that matters.
+///
+/// "No deny rule" means no entry under `permissions.deny` at all, not "no
+/// entry this gate understands": `Bash` on its own denies every Bash call,
+/// and `append_bash_rules` keeps only the `Bash(…)` forms, so counting the
+/// extracted patterns would read a configured user as an unconfigured one.
+///
+/// No other caller gets this answer, and the reasons differ per host rather
+/// than being one oversight:
+///
+/// - Gemini's loader reads `tools.allowed` and `tools.confirmationRequired`
+///   only, and never produces a deny rule, so its exclude lists are invisible
+///   here;
+/// - Droid's built-in defaults are deliberately not mirrored, so an empty
+///   `commandDenylist` says nothing about what Droid refuses;
+/// - Cursor's loader reads the global `cli-config.json`, while the host also
+///   applies its project config;
+/// - Copilot resolves to [`Host::Claude`] for its verdict, but judges the
+///   returned command with its own allowlist flow;
+/// - OpenCode re-evaluates its own patterns against the string RTK hands back;
+/// - Codex, Trae, Vibe and Antigravity have no RTK-side rule source at all;
+/// - `rtk rewrite` reads Claude's rules for delegates that do not prompt on
+///   exit 3 at all (`hooks/pi/rtk.ts`, `hooks/hermes/rtk-rewrite`), and
+///   OpenClaw matches its exec checks against the returned string.
+pub(crate) fn claude_hook_deny_rules() -> DenyRules {
+    let mut scan = SettingsScan::default();
+    let _ = load_permission_rules_tracking(&get_settings_paths(), &mut scan);
+    if scan.every_file_read && !scan.any_deny_entry {
+        DenyRules::NoneConfigured
+    } else {
+        DenyRules::Unattested
+    }
+}
+
+/// [`claude_hook_deny_rules`] where a wrap is possible at all: the wrap is
+/// enabled and `cmd` is provably fish. Anywhere else the answer cannot change
+/// a decision, so the settings are not walked a second time for it.
+///
+/// `rtk hook claude` and `rtk hook check --agent claude` both ask here, so the
+/// two read the settings the same number of times.
+pub(crate) fn claude_hook_deny_rules_for(cmd: &str) -> DenyRules {
+    if crate::core::config::cached_config().hooks.wrap_fish_scripts
+        && crate::discover::fish_script::is_unambiguous_fish(cmd)
+    {
+        claude_hook_deny_rules()
+    } else {
+        DenyRules::Unattested
+    }
+}
+
+/// What [`load_permission_rules_tracking`] saw besides the rules themselves.
+struct SettingsScan {
+    /// Every settings file that exists was opened, decoded and parsed.
+    every_file_read: bool,
+    /// At least one entry appears under `permissions.deny`, whatever its tool.
+    any_deny_entry: bool,
+}
+
+impl Default for SettingsScan {
+    fn default() -> Self {
+        Self {
+            every_file_read: true,
+            any_deny_entry: false,
+        }
+    }
+}
+
 /// Load `host`'s deny/ask/allow Bash rules from disk, doing the settings-file I/O
-/// exactly once. Exposed so a caller that checks many commands against the same
-/// host in a loop (e.g. `rtk discover` scanning thousands of transcript commands)
-/// can load once up front and reuse `check_command_with_rules` per command instead
-/// of going through `check_command_for` and re-reading every settings file from
+/// exactly once.
+///
+/// Every caller reads its rules through here and keeps them: a verdict needs
+/// all three, and a caller that checks many commands against the same host in
+/// a loop (e.g.
+/// `rtk discover` scanning thousands of transcript commands) reuses them per
+/// command instead of re-reading every settings file from
 /// disk on every single call.
 pub(crate) fn load_rules_for(host: Host) -> (Vec<String>, Vec<String>, Vec<String>) {
     match host {
@@ -281,6 +389,21 @@ fn load_permission_rules() -> (Vec<String>, Vec<String>, Vec<String>) {
 }
 
 fn load_permission_rules_from(paths: &[PathBuf]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    load_permission_rules_tracking(paths, &mut SettingsScan::default())
+}
+
+/// [`load_permission_rules_from`], recording in `scan` what the walk saw
+/// besides the rules it extracts: a file it could not read or parse, and
+/// whether any deny entry exists at all.
+///
+/// Both are the difference between "this user configured no deny rule" and
+/// "RTK saw none" — see [`claude_hook_deny_rules`]. The rules themselves are
+/// unaffected: the fail-closed `ask *` a skipped file contributes is the same
+/// either way.
+fn load_permission_rules_tracking(
+    paths: &[PathBuf],
+    scan: &mut SettingsScan,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut deny_rules = Vec::new();
     let mut ask_rules = Vec::new();
     let mut allow_rules = Vec::new();
@@ -288,6 +411,9 @@ fn load_permission_rules_from(paths: &[PathBuf]) -> (Vec<String>, Vec<String>, V
     for path in paths {
         let content = match std::fs::read_to_string(path) {
             Ok(content) => content,
+            // A file that is not there denies nothing. One that is there and
+            // could not be read — permissions, or bytes that are not UTF-8 —
+            // may hold anything.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 eprintln!(
@@ -296,6 +422,7 @@ fn load_permission_rules_from(paths: &[PathBuf]) -> (Vec<String>, Vec<String>, V
                     e
                 );
                 ask_rules.push("*".to_string());
+                scan.every_file_read = false;
                 continue;
             }
         };
@@ -308,12 +435,17 @@ fn load_permission_rules_from(paths: &[PathBuf]) -> (Vec<String>, Vec<String>, V
                 path.display()
             );
             ask_rules.push("*".to_string());
+            scan.every_file_read = false;
             continue;
         };
         let Some(permissions) = json.get("permissions") else {
             continue;
         };
 
+        scan.any_deny_entry |= permissions
+            .get("deny")
+            .and_then(Value::as_array)
+            .is_some_and(|rules| !rules.is_empty());
         append_bash_rules(permissions.get("deny"), &mut deny_rules);
         append_bash_rules(permissions.get("ask"), &mut ask_rules);
         append_bash_rules(permissions.get("allow"), &mut allow_rules);
@@ -555,31 +687,34 @@ fn strip_grammar_residue(segment: &str) -> &str {
     }
 }
 
+/// One space between words, line continuations elided.
+///
+/// Shares the lexer's word-boundary definition rather than
+/// `str::split_whitespace()`, so a bare `\r` in a command never collapses into
+/// a space.
+///
+/// A line continuation goes first: bash elides `\<newline>` entirely and joins
+/// the words either side, so splitting on the newline alone would leave a
+/// stray `\` in front of the command that no pattern matches. Only the LF
+/// form: against CRLF the backslash escapes the `\r` and the `\n` still
+/// terminates the command, in bash and in the lexer alike, so the words either
+/// side are already separate segments.
+fn normalize_command_text(text: &str) -> String {
+    text.replace("\\\n", "")
+        .split(is_word_boundary_whitespace)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Pattern forms:
 /// - `*` → matches everything
 /// - `prefix:*` or `prefix *` (trailing `*`, no other wildcards) → prefix match with word boundary
 /// - `* suffix`, `pre * suf` → glob matching where `*` matches any sequence of characters
 /// - `pattern` → exact match or prefix match (cmd must equal pattern or start with `{pattern} `)
 pub(crate) fn command_matches_pattern(cmd: &str, pattern: &str) -> bool {
-    // Shares the lexer's word-boundary definition rather than
-    // str::split_whitespace(), so a bare `\r` in `cmd` never collapses into a space.
-    //
-    // A line continuation is removed first: bash elides `\<newline>` entirely
-    // and joins the words either side, so splitting on the newline alone would
-    // leave a stray `\` in front of the command that no pattern matches.
-    //
-    // Only the LF form: against CRLF the backslash escapes the `\r` and the
-    // `\n` still terminates the command, in bash and in the lexer alike, so
-    // the words either side are already separate segments.
-    let normalize = |s: &str| {
-        s.replace("\\\n", "")
-            .split(is_word_boundary_whitespace)
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let cmd_norm = normalize(cmd);
-    let pattern_norm = normalize(pattern);
+    let cmd_norm = normalize_command_text(cmd);
+    let pattern_norm = normalize_command_text(pattern);
     let cmd = cmd_norm.as_str();
     let pattern = pattern_norm.as_str();
 
