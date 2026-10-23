@@ -84,14 +84,17 @@ pub fn check_command_for_agent(cmd: &str, host: Host, agent: Option<&str>) -> Pe
 /// different from an ordinary rewrite: a host's own rule on a command RTK
 /// never rewrites still fires today, and would not fire on the wrapped form.
 ///
-/// So the wrap needs a host that enforces exactly the rules RTK reads, and
-/// there is one: Claude Code's own hook. See [`claude_hook_deny_rules`].
+/// So the wrap is offered on one host only, Claude Code's own hook: RTK reads
+/// its settings files, and the hook asks explicitly for every wrap it builds, so no
+/// allow rule matching `rtk` can run the script unprompted. See
+/// [`claude_hook_deny_rules`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DenyRules {
     /// Every settings file RTK reads parsed, and none carries a deny rule.
     NoneConfigured,
-    /// Anything else: a deny rule is present, a file could not be parsed, or
-    /// this caller is not a host whose rules RTK both reads and decides.
+    /// Anything else: a deny rule is present, a file could not be parsed, the
+    /// wrap is off, the command is not provably fish, or this caller is not
+    /// the Claude hook.
     Unattested,
 }
 
@@ -104,11 +107,12 @@ impl DenyRules {
 
 /// What RTK can say about the deny rules in force for `rtk hook claude`.
 ///
-/// Claude Code's hook takes RTK's decision as final, and the settings files
-/// [`load_permission_rules`] reads are the whole of its rule source — so an
-/// empty deny list there is evidence that there is nothing to escape, but
-/// only when RTK read and parsed every one of those files. A file it had to
-/// skip may name the rule that matters.
+/// The settings files [`load_permission_rules`] reads are the rules RTK can
+/// see, not all of Claude Code's: `--settings`, `--disallowedTools`, managed
+/// settings and the project the agent has `cd`'d away from never reach the
+/// hook, which is why every wrap is also an explicit ask. Within what RTK can
+/// see, an empty deny list is evidence only when RTK read and parsed every
+/// one of those files. A file it had to skip may name the rule that matters.
 ///
 /// "No deny rule" means no entry under `permissions.deny` at all, not "no
 /// entry this gate understands": `Bash` on its own denies every Bash call,
@@ -137,6 +141,22 @@ pub(crate) fn claude_hook_deny_rules() -> DenyRules {
     let _ = load_permission_rules_tracking(&get_settings_paths(), &mut scan);
     if scan.every_file_read && !scan.any_deny_entry {
         DenyRules::NoneConfigured
+    } else {
+        DenyRules::Unattested
+    }
+}
+
+/// [`claude_hook_deny_rules`] where a wrap is possible at all: the wrap is
+/// enabled and `cmd` is provably fish. Anywhere else the answer cannot change
+/// a decision, so the settings are not walked a second time for it.
+///
+/// `rtk hook claude` and `rtk hook check --agent claude` both ask here, so the
+/// two read the settings the same number of times.
+pub(crate) fn claude_hook_deny_rules_for(cmd: &str) -> DenyRules {
+    if crate::core::config::cached_config().hooks.wrap_fish_scripts
+        && crate::discover::fish_script::is_unambiguous_fish(cmd)
+    {
+        claude_hook_deny_rules()
     } else {
         DenyRules::Unattested
     }

@@ -265,23 +265,15 @@ fn decide_hook_action(cmd: &str, host: permissions::Host, cwd: Option<&str>) -> 
     )
 }
 
-/// [`decide_hook_action`] for Claude Code's own hook, the one host that
-/// enforces exactly the rules RTK reads. Copilot shares `Host::Claude` for its
-/// verdict but judges the returned command itself, so it keeps
-/// [`decide_hook_action`].
+/// [`decide_hook_action`] for Claude Code's own hook, the one host whose
+/// settings RTK reads and whose hook asks explicitly for a wrap. Copilot
+/// shares `Host::Claude` for its verdict but judges the returned command
+/// itself, so it keeps [`decide_hook_action`].
 fn decide_claude_hook_action(cmd: &str, cwd: Option<&str>) -> HookDecision {
-    // The attestation walks the settings files a second time, so it is only
-    // asked for when the answer can matter: the classification is pure, and
-    // says no for every command that is not provably fish.
-    let deny_rules = if crate::discover::fish_script::is_unambiguous_fish(cmd) {
-        permissions::claude_hook_deny_rules()
-    } else {
-        permissions::DenyRules::Unattested
-    };
     decide_from_verdict(
         cmd,
         permissions::check_command_for(cmd, permissions::Host::Claude),
-        deny_rules,
+        permissions::claude_hook_deny_rules_for(cmd),
         cwd,
     )
 }
@@ -758,7 +750,16 @@ fn process_claude_payload_from_decision(
     // `--disallowedTools`, managed settings, a project the agent has moved
     // away from) could no longer match anything inside it. Asking is the only
     // outcome that does not depend on rules this hook cannot see.
-    let permission_decision = if crate::discover::fish_script::is_wrapped(&rewritten) {
+    //
+    // Only a wrap RTK built qualifies. None exists with the flag off, so the
+    // hook then answers exactly as it does without the feature. With it on,
+    // `try_wrap` never wraps a command whose first word is `rtk`, so a command
+    // that already starts in the wrap form is one the agent typed: the rules
+    // only rewrote around it, and it keeps its ordinary decision.
+    let permission_decision = if crate::core::config::cached_config().hooks.wrap_fish_scripts
+        && crate::discover::fish_script::is_wrapped(&rewritten)
+        && !crate::discover::fish_script::is_wrapped(cmd.trim_start())
+    {
         Some("ask")
     } else {
         allow.then_some("allow")

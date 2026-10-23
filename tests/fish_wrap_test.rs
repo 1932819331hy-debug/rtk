@@ -435,7 +435,7 @@ mod unix {
     /// The pipeline's `Swap` gate asks the shared decision whether RTK would
     /// touch the command at all, and uses the answer as a yes/no on the
     /// pipeline's *own* replacement command. A wrap must never be that answer:
-    /// the gate would then hand the fish script to `sh -c`.
+    /// the gate would then swap a script it otherwise defers into `sh -c`.
     #[test]
     fn the_pipeline_swap_gate_never_sees_a_wrap() {
         if which::which("fish").is_err() {
@@ -731,6 +731,98 @@ mode = "swap"
             v.pointer("/hookSpecificOutput/permissionDecision")
                 .and_then(serde_json::Value::as_str),
             Some("allow")
+        );
+    }
+
+    /// Only a wrap RTK built asks explicitly. An `rtk run --shell fish -c …` the
+    /// agent typed itself, which the rules only rewrote around, keeps the
+    /// decision it gets without the feature: an allow where the rules allow
+    /// every part, and no `permissionDecision` at all where they leave it to
+    /// the host. With the wrap off that holds for any spelling. With it on, a
+    /// typed form behind a leading line continuation is still asked for: the
+    /// rules drop the continuation, so the hook cannot tell it from a wrap.
+    #[test]
+    fn a_typed_wrap_form_keeps_its_decision() {
+        for (enabled, command) in [
+            (None, "rtk run --shell fish -c 'echo ok' && git status"),
+            (
+                Some(true),
+                "rtk run --shell fish -c 'echo ok' && git status",
+            ),
+            // The rules drop a leading line continuation, so the rewritten
+            // text starts in the wrap form while the typed one does not.
+            (None, "\\\nrtk run --shell fish -c 'echo ok' && git status"),
+            // Leading whitespace is not a different command.
+            (
+                Some(true),
+                "  rtk run --shell fish -c 'echo ok' && git status",
+            ),
+        ] {
+            for (allow, expected) in [
+                (r#"["Bash(rtk:*)","Bash(git:*)"]"#, Some("allow")),
+                (r#"["Bash(rtk:*)"]"#, None),
+            ] {
+                let settings = format!(r#"{{"permissions":{{"allow":{allow}}}}}"#);
+                let home = home_with_wrap(&[(".claude/settings.json", settings.as_str())], enabled);
+                let output = hook_stdin("claude", &claude_payload(command), &home);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let v: serde_json::Value = serde_json::from_str(stdout.trim())
+                    .unwrap_or_else(|e| panic!("{command:?}: {stdout}: {e}"));
+
+                assert_eq!(
+                    v.pointer("/hookSpecificOutput/updatedInput/command")
+                        .and_then(serde_json::Value::as_str),
+                    Some("rtk run --shell fish -c 'echo ok' && rtk git status"),
+                    "control: the rules rewrite around the typed form ({enabled:?}, {allow}, {command:?})"
+                );
+                assert_eq!(
+                    v.pointer("/hookSpecificOutput/permissionDecision")
+                        .and_then(serde_json::Value::as_str),
+                    expected,
+                    "{enabled:?}, {allow}, {command:?}"
+                );
+            }
+        }
+    }
+
+    /// With the wrap off, a fish script costs the hook and `rtk hook check`
+    /// nothing they did not cost before: the settings are walked as often as
+    /// for any other command, so a file RTK cannot parse warns as often too.
+    #[test]
+    fn a_fish_script_reads_the_settings_no_more_often_when_the_wrap_is_off() {
+        const FISH: &str = "git diff HEAD~3 HEAD; and true";
+        let count = |output: Output| {
+            String::from_utf8_lossy(&output.stderr)
+                .matches("failed to parse permissions")
+                .count()
+        };
+        let hook = |home: &tempfile::TempDir, command: &str| {
+            count(hook_stdin("claude", &claude_payload(command), home))
+        };
+        let check =
+            |home: &tempfile::TempDir, command: &str| count(hook_check("claude", command, home));
+
+        let off = home_with_wrap(&[(".claude/settings.json", "{ not json")], None);
+        let plain = hook(&off, "git status");
+        assert!(plain > 0, "control: the broken file must warn at all");
+        assert_eq!(hook(&off, FISH), plain, "rtk hook claude");
+        assert_eq!(
+            check(&off, FISH),
+            check(&off, "git status"),
+            "rtk hook check"
+        );
+        assert_eq!(check(&off, "git status"), plain, "rtk hook check");
+
+        // The control: with the wrap on, the same script is attested, which
+        // walks the settings again, so the count is what tells them apart.
+        let on = home_with_wrap(&[(".claude/settings.json", "{ not json")], Some(true));
+        assert!(
+            hook(&on, FISH) > plain,
+            "control: {FISH} classifies as fish"
+        );
+        assert!(
+            check(&on, FISH) > check(&on, "git status"),
+            "control: rtk hook check attests only what the hook attests"
         );
     }
 

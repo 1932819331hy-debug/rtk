@@ -102,7 +102,7 @@ the wrap so it costs no savings. **Off unless `hooks.wrap_fish_scripts =
 true`**, and skipped anyway without a resolvable `fish` binary or on Windows;
 those cases take the decision path they always did.
 
-**Every wrap carries `"permissionDecision": "ask"`.** Without it, Claude Code
+**Every wrap RTK builds carries `"permissionDecision": "ask"`.** Without it, Claude Code
 runs its own permission check on what the hook returned — and what it sees is
 one `rtk run` command, not the script's. An allow rule matching `rtk` would
 run the whole script unprompted, and a rule naming one of the script's own
@@ -123,8 +123,8 @@ whose expansion differs between fish versions. The wrap also puts *every*
 command of the script inside one quoted argument, which is what separates it
 from an ordinary rewrite: a host's own rule on a command RTK never rewrites
 still fires today, and would not fire on the wrapped form. So the wrap needs a
-host that enforces exactly the rules RTK reads, and Claude Code's hook is the
-only one:
+host whose rule files RTK reads and whose hook can ask for the wrap explicitly,
+and Claude Code's hook is the only one:
 
 - Gemini's loader reads `tools.allowed` and `tools.confirmationRequired` only
   and never yields a deny rule, so its exclude lists are invisible here;

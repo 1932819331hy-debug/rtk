@@ -10,8 +10,8 @@
 //! | `rtk hook check` (`main.rs`) | whatever the named `--agent` consults, via [`AgentPath`] | suppressed |
 //!
 //! Each also hands [`decide`] a [`DenyRules`], which is not the verdict but a
-//! statement about the *caller*: whether it is the one path whose host both
-//! reads its deny rules through RTK and takes RTK's decision as final. That
+//! statement about the *caller*: whether it is the one path whose deny rules
+//! RTK reads and whose hook asks explicitly for every wrap it builds. That
 //! is what decides whether a fish script may be wrapped, because once a
 //! script reaches a fish the verdict no longer describes what runs. Only
 //! `rtk hook claude` qualifies — see
@@ -144,7 +144,7 @@ impl ApprovalOwner {
 ///    refuses, and is offered only when [`DenyRules`] says RTK reads this
 ///    host's deny rules and it has none: past this point the script is read by
 ///    a fish, where gate 1's segmenter no longer describes what runs.
-///    `hooks.wrap_fish_scripts` turns it off; `src/hooks/README.md` records
+///    Off unless `hooks.wrap_fish_scripts` turns it on; `src/hooks/README.md` records
 ///    why it runs ahead of gate 3.
 /// 3. **Unattestable constructs are refused.** Command substitution and
 ///    file-target redirects can't be decomposed into segments the permission
@@ -351,8 +351,8 @@ pub(crate) fn suppress_identity(cmd: &str, decision: HookDecision) -> HookDecisi
 /// `rtk rewrite` do so in their own plugin, because `rtk rewrite` reports the
 /// no-op rather than suppressing it (see [`suppress_identity`]).
 pub(crate) enum AgentPath {
-    /// `rtk hook claude` — the one host that both reads its rules through RTK
-    /// and takes RTK's decision as final, which is what the fish wrap needs
+    /// `rtk hook claude` — the one host whose rules RTK reads and whose hook
+    /// asks explicitly for every wrap it builds, which is what the fish wrap needs
     /// (`permissions::claude_hook_deny_rules`). Copilot reads the same
     /// settings but judges the returned command itself, so it is
     /// [`AgentPath::InProcess`] like every other host.
@@ -472,10 +472,12 @@ impl AgentPath {
     /// command to a host that judges it again — see
     /// [`claude_hook_deny_rules`](super::permissions::claude_hook_deny_rules).
     /// A rules-file install has no hook at all, so `rtk hook check` must not
-    /// show it a wrap nothing would ever emit.
-    fn deny_rules(&self) -> DenyRules {
+    /// show it a wrap nothing would ever emit. The Claude hook's answer comes
+    /// from the same gate the hook itself uses, so the two walk the settings
+    /// alike.
+    fn deny_rules(&self, cmd: &str) -> DenyRules {
         match self {
-            Self::ClaudeHook => super::permissions::claude_hook_deny_rules(),
+            Self::ClaudeHook => super::permissions::claude_hook_deny_rules_for(cmd),
             Self::InProcess(_) | Self::ViaRewrite(_) | Self::RulesOnly => DenyRules::Unattested,
         }
     }
@@ -494,8 +496,10 @@ impl AgentPath {
     /// relaxing the default ask the agent would only ask about twice.
     pub(crate) fn decide(&self, cmd: &str) -> HookDecision {
         let verdict = self.verdict(cmd);
-        self.approval_owner()
-            .apply(decide_for_agent(cmd, verdict, self.deny_rules()), verdict)
+        self.approval_owner().apply(
+            decide_for_agent(cmd, verdict, self.deny_rules(cmd)),
+            verdict,
+        )
     }
 }
 
