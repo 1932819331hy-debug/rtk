@@ -647,7 +647,6 @@ fn antigravity_global_init_cleans_workspace_legacy_rules() {
             !legacy_file.exists(),
             "Global init in workspace must remove legacy rules"
         );
-        #[cfg(unix)]
         assert!(
             home.path()
                 .join(".gemini/config/plugins/rtk/plugin.json")
@@ -873,4 +872,32 @@ fn antigravity_init_ignores_non_utf8_legacy_file() {
         invalid_bytes,
         "non-UTF-8 file must remain untouched"
     );
+}
+
+#[test]
+fn antigravity_init_skips_legacy_path_that_is_not_a_regular_file() {
+    for name in ["directory", "parent is a file"] {
+        for args in [
+            &["--agent", "antigravity"][..],
+            &["--agent", "antigravity", "--uninstall"][..],
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            if name == "directory" {
+                fs::create_dir_all(project.path().join(LEGACY_RULES_PATH)).unwrap();
+            } else {
+                fs::create_dir_all(project.path().join(".agents")).unwrap();
+                fs::write(project.path().join(".agents/rules"), "not a directory").unwrap();
+            }
+
+            let output = run_init(project.path(), home.path(), args);
+            assert!(output.status.success(), "{name} {args:?}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for marker in ["Legacy:", "legacy rules file", "legacy awareness text"] {
+                assert!(!stdout.contains(marker), "{name} {args:?}: {stdout}");
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains("[warn]"), "{name} {args:?}: {stderr}");
+        }
+    }
 }

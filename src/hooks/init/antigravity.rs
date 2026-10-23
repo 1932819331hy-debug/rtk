@@ -154,7 +154,10 @@ pub enum LegacyRulesAction {
 /// - If the file has that awareness text appended after user content following a blank line,
 ///   remove only the RTK suffix, keeping the user content byte-identical.
 /// - Leave any other file at that path (including non-UTF-8 files) untouched and silent.
-/// - On I/O or permission errors, print a `[warn]` message to `stderr` naming the file and
+/// - Skip silently, without opening it, a path that is not a regular file (a FIFO, a
+///   directory, a dangling link) or that cannot be stat'ed.
+/// - When reading, removing or rewriting the file fails (other than the file vanishing before
+///   it is read, or not being UTF-8), print a `[warn]` message to `stderr` naming the file and
 ///   return `None` so the primary install/uninstall command still succeeds.
 pub fn migrate_legacy_rules_at(
     workspace_root: &Path,
@@ -740,6 +743,72 @@ mod tests {
         let action = migrate_legacy_rules_at(temp.path(), InitContext::default());
         assert_eq!(action, None);
         assert_eq!(fs::read_to_string(&legacy_file).unwrap(), single_nl);
+    }
+
+    /// Earlier releases appended nothing to a file already mentioning `RTK` or `rtk`, so a
+    /// prefix that does was written by hand and keeps the block that follows it.
+    #[test]
+    fn test_migrate_legacy_rules_prefix_mentioning_rtk_untouched() {
+        for (prefix, text) in [
+            (
+                "Prefer RTK Query for data fetching.",
+                LEGACY_ANTIGRAVITY_RULES_V036,
+            ),
+            ("Use rtk for git commands.", LEGACY_ANTIGRAVITY_RULES_V049),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let legacy_file = temp.path().join(LEGACY_RULES_REL_PATH);
+            fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
+            let content = format!("{prefix}\n\n{text}");
+            fs::write(&legacy_file, &content).unwrap();
+
+            let action = migrate_legacy_rules_at(temp.path(), InitContext::default());
+            assert_eq!(action, None, "{prefix}");
+            assert_eq!(fs::read_to_string(&legacy_file).unwrap(), content);
+        }
+    }
+
+    /// A FIFO is skipped without being opened: opening it would block until a writer shows up.
+    /// The writer here would hand over the exact legacy text, so a migration that opened the
+    /// FIFO would remove it.
+    #[cfg(unix)]
+    #[test]
+    fn test_migrate_legacy_rules_skips_fifo_without_opening_it() {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let temp = TempDir::new().unwrap();
+        let legacy_file = temp.path().join(LEGACY_RULES_REL_PATH);
+        fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
+        // Shelled out rather than called through libc: `unsafe` is not allowed outside proxy
+        // mode's signal handling.
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&legacy_file)
+                .status()
+                .unwrap()
+                .success(),
+            "mkfifo failed"
+        );
+
+        let writer_path = legacy_file.clone();
+        let writer = std::thread::spawn(move || {
+            if let Ok(mut handle) = fs::OpenOptions::new().write(true).open(&writer_path) {
+                let _ = handle.write_all(LEGACY_ANTIGRAVITY_RULES_V036.as_bytes());
+            }
+        });
+
+        let action = migrate_legacy_rules_at(temp.path(), InitContext::default());
+        assert_eq!(action, None);
+        assert!(legacy_file.exists(), "the FIFO must be left in place");
+
+        // Open a non-blocking reader so the writer's open returns and the thread ends.
+        let _reader = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&legacy_file)
+            .unwrap();
+        writer.join().unwrap();
     }
 
     #[test]
