@@ -50,6 +50,9 @@ pub enum Language {
     C,
     Cpp,
     Java,
+    CStyle,
+    CStyleDoc,
+    Css,
     Ruby,
     Shell,
     Data,
@@ -61,12 +64,16 @@ impl Language {
         match ext.to_lowercase().as_str() {
             "rs" => Language::Rust,
             "py" | "pyw" => Language::Python,
-            "js" | "mjs" | "cjs" => Language::JavaScript,
-            "ts" | "tsx" => Language::TypeScript,
+            "js" | "mjs" | "cjs" | "jsx" => Language::JavaScript,
+            "ts" | "tsx" | "mts" | "cts" => Language::TypeScript,
             "go" => Language::Go,
             "c" | "h" => Language::C,
             "cpp" | "cc" | "cxx" | "hpp" | "hh" => Language::Cpp,
             "java" => Language::Java,
+            "kt" | "kts" | "scala" | "groovy" | "gradle" | "proto" | "scss" | "less" | "m"
+            | "mm" | "wgsl" | "hlsl" | "metal" => Language::CStyle,
+            "swift" | "cs" | "dart" | "wit" => Language::CStyleDoc,
+            "css" => Language::Css,
             "rb" => Language::Ruby,
             "sh" | "bash" | "zsh" => Language::Shell,
             "json" | "jsonc" | "json5" | "yaml" | "yml" | "toml" | "xml" | "csv" | "tsv"
@@ -79,7 +86,7 @@ impl Language {
 
     pub fn comment_patterns(&self) -> CommentPatterns {
         match self {
-            Language::Rust => CommentPatterns {
+            Language::Rust | Language::CStyleDoc => CommentPatterns {
                 line: Some("//"),
                 block_start: Some("/*"),
                 block_end: Some("*/"),
@@ -98,12 +105,20 @@ impl Language {
             | Language::Go
             | Language::C
             | Language::Cpp
-            | Language::Java => CommentPatterns {
+            | Language::Java
+            | Language::CStyle => CommentPatterns {
                 line: Some("//"),
                 block_start: Some("/*"),
                 block_end: Some("*/"),
                 doc_line: None,
                 doc_block_start: Some("/**"),
+            },
+            Language::Css => CommentPatterns {
+                line: None,
+                block_start: Some("/*"),
+                block_end: Some("*/"),
+                doc_line: None,
+                doc_block_start: None,
             },
             Language::Ruby => CommentPatterns {
                 line: Some("#"),
@@ -358,8 +373,8 @@ pub struct AggressiveFilter;
 
 impl FilterStrategy for AggressiveFilter {
     fn filter(&self, content: &str, lang: &Language) -> String {
-        // Data formats (JSON, YAML, etc.) must never be code-filtered
-        if *lang == Language::Data {
+        // Unknown formats cannot safely be reduced to a code skeleton.
+        if matches!(lang, Language::Data | Language::Unknown) {
             return MinimalFilter.filter(content, lang);
         }
 
@@ -464,6 +479,63 @@ mod tests {
         assert_eq!(Language::from_extension("rs"), Language::Rust);
         assert_eq!(Language::from_extension("py"), Language::Python);
         assert_eq!(Language::from_extension("js"), Language::JavaScript);
+    }
+
+    #[test]
+    fn test_javascript_and_typescript_extension_aliases() {
+        assert_eq!(Language::from_extension("jsx"), Language::JavaScript);
+        assert_eq!(Language::from_extension("mts"), Language::TypeScript);
+        assert_eq!(Language::from_extension("cts"), Language::TypeScript);
+    }
+
+    #[test]
+    fn test_c_syntax_extensions_strip_comments_and_preserve_strings() {
+        let source = "// ordinary comment\n/* block comment\nstill comment */\nlet value = \"/* not a comment\";\nlet url = \"https://example.com\";";
+        let expected = "let value = \"/* not a comment\";\nlet url = \"https://example.com\";";
+        for ext in [
+            "jsx", "mts", "cts", "kt", "kts", "swift", "scala", "cs", "dart", "groovy", "gradle",
+            "proto", "scss", "less", "m", "mm", "wit", "wgsl", "hlsl", "metal",
+        ] {
+            let lang = Language::from_extension(ext);
+            assert_ne!(lang, Language::Unknown, "unrecognized extension: {ext}");
+            assert_eq!(Language::from_extension(&ext.to_uppercase()), lang);
+            assert_eq!(MinimalFilter.filter(source, &lang), expected, "{ext}");
+            assert_eq!(
+                AggressiveFilter.filter(
+                    "/* opening {\nimport fake\nlet fake = 1;\n*/\nconst value = 1;",
+                    &lang
+                ),
+                "const value = 1;",
+                "comments must not enter the code skeleton for {ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_c_syntax_documentation_lines_are_preserved() {
+        let source = "/// Public documentation\n// ordinary comment\nlet value = 1;";
+        for ext in ["swift", "cs", "dart", "wit"] {
+            assert_eq!(
+                MinimalFilter.filter(source, &Language::from_extension(ext)),
+                "/// Public documentation\nlet value = 1;",
+                "{ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_css_only_strips_block_comments() {
+        let source = "/* stylesheet comment */\n/** ordinary CSS comment */\n// not a CSS comment\na::before { content: \"/*\"; }\na { background: url(https://example.com/icon); }";
+        assert_eq!(
+            MinimalFilter.filter(source, &Language::from_extension("css")),
+            "// not a CSS comment\na::before { content: \"/*\"; }\na { background: url(https://example.com/icon); }"
+        );
+    }
+
+    #[test]
+    fn test_unknown_aggressive_preserves_non_code_lines() {
+        let source = "plain text\nconst this only looks like code\nmore plain text\nimport not-a-module\nlast line";
+        assert_eq!(AggressiveFilter.filter(source, &Language::Unknown), source);
     }
 
     #[test]

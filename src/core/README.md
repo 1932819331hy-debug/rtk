@@ -43,6 +43,11 @@ files* (used by `rtk read`) rather than command output. At `-l minimal` it
 strips comments using the per-language delimiters in
 `Language::comment_patterns()`.
 
+JSX uses JavaScript patterns, and MTS/CTS use TypeScript patterns. Other
+C-style extensions use `//` and `/* */`; Swift, C#, Dart, and WIT also retain
+`///` documentation lines. CSS only uses block comments. Unknown formats skip
+the code-skeleton reduction at `-l aggressive`.
+
 Python does not use that walk. It has no block comments — `"""` opens a
 *string*, which may be a docstring or an ordinary value — so it gets a
 string-aware path that removes `#` comments and leaves string contents alone.
