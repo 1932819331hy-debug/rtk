@@ -1,0 +1,12 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_________________________________ test_banner __________________________________
+test_banner.py:6: in test_banner
+    assert 1 == 2, "real failure"
+E   AssertionError: real failure
+E   assert 1 == 2
+----------------------------- Captured stdout call -----------------------------
+_____ stage one _____
+_ stage two _
+E   not an error
+1 failed in 0.01s

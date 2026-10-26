@@ -1,0 +1,11 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+________________________________ test_indented _________________________________
+test_indented.py:4: in test_indented
+    assert 1 == 2, "real failure"
+E   AssertionError: real failure
+E   assert 1 == 2
+----------------------------- Captured stdout call -----------------------------
+    ___________________________________ phantom ____________________________________
+E   captured diagnostic
+1 failed in 0.01s

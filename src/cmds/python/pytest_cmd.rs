@@ -124,6 +124,10 @@ pub(crate) fn filter_pytest_output(output: &str) -> String {
     let mut current_failure: Vec<String> = Vec::new();
     let mut xfail_lines: Vec<String> = Vec::new();
     let mut summary_line = String::new();
+    let mut section_width = 0;
+    let mut in_capture = false;
+    let mut captured_header = false;
+    let mut header_count = 0;
 
     for line in output.lines() {
         let trimmed = line.trim();
@@ -138,6 +142,8 @@ pub(crate) fn filter_pytest_output(output: &str) -> String {
             && (trimmed.contains("FAILURES") || trimmed.contains("ERRORS"))
         {
             state = ParseState::Failures;
+            section_width = trimmed.chars().count();
+            in_capture = false;
             if !current_failure.is_empty() {
                 failures.push(current_failure.join("\n"));
                 current_failure.clear();
@@ -173,6 +179,9 @@ pub(crate) fn filter_pytest_output(output: &str) -> String {
                 }
             }
             ParseState::Failures => {
+                let header = is_block_header(trimmed);
+                captured_header |= in_capture && header;
+                in_capture |= is_captured_section(line);
                 // Collect failure details
                 if trimmed.starts_with("===")
                     && trimmed.trim_matches('=').trim() == "warnings summary"
@@ -182,8 +191,15 @@ pub(crate) fn filter_pytest_output(output: &str) -> String {
                         current_failure.clear();
                     }
                     state = ParseState::TestProgress;
-                } else if is_block_header(trimmed) {
+                } else if header
+                    && line.starts_with('_')
+                    // pytest fills the section width, or exceeds it for long IDs.
+                    // Short banners inside captured output cannot be its separators.
+                    && (!in_capture || trimmed.chars().count() >= section_width)
+                {
                     // New failure section
+                    header_count += 1;
+                    in_capture = false;
                     if !current_failure.is_empty() {
                         failures.push(current_failure.join("\n"));
                         current_failure.clear();
@@ -207,6 +223,15 @@ pub(crate) fn filter_pytest_output(output: &str) -> String {
     // Save last failure if any
     if !current_failure.is_empty() {
         failures.push(current_failure.join("\n"));
+    }
+
+    if captured_header {
+        let counts = parse_summary_line(&summary_line);
+        if header_count != counts.failed + counts.errors {
+            // Captured text can even imitate a full-width separator. Do not invent
+            // failures when the candidate blocks disagree with pytest's totals.
+            return output.to_string();
+        }
     }
 
     // Build compact output
@@ -486,6 +511,56 @@ fn parse_duration(summary: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Captured with pytest 9.1.1, --tb=short -q -rxX --color=no; only
+    // elapsed times are normalized.
+    #[test]
+    fn test_filter_pytest_captured_banners_do_not_open_failures() {
+        let raw = include_str!("../../../tests/fixtures/pytest_captured_banners_raw.txt");
+        let filtered = filter_pytest_output(raw);
+        assert_eq!(
+            filtered,
+            "Pytest: 0 passed, 1 failed in 0.01s\n\nFailures:\n1. [FAIL] test_banner\n     test_banner.py:6: in test_banner\n     E   AssertionError: real failure\n     E   assert 1 == 2"
+        );
+        assert!(filtered.len() * 100 <= raw.len() * 80);
+    }
+
+    #[test]
+    fn test_filter_pytest_banners_preserve_following_failure_headers() {
+        let raw = include_str!("../../../tests/fixtures/pytest_banners_then_failures_raw.txt");
+        let filtered = filter_pytest_output(raw);
+        assert_eq!(filtered.matches("[FAIL]").count(), 3, "{filtered}");
+        assert!(filtered.contains("1. [FAIL] test_banner\n"), "{filtered}");
+        assert!(filtered.contains("3. [FAIL] test_after\n"), "{filtered}");
+        assert!(
+            filtered.contains("2. [FAIL] test_long_parameter[xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]\n"),
+            "{filtered}"
+        );
+        for detail in ["real failure", "later failure", "long parameter failure"] {
+            assert!(filtered.contains(detail), "{filtered}");
+        }
+        assert!(!filtered.contains("stage one"), "{filtered}");
+        assert!(!filtered.contains("stage two"), "{filtered}");
+        assert!(!filtered.contains("not an error"), "{filtered}");
+        assert!(filtered.len() * 100 <= raw.len() * 80);
+    }
+
+    #[test]
+    fn test_filter_pytest_ambiguous_captured_header_preserves_raw_output() {
+        let raw = include_str!("../../../tests/fixtures/pytest_captured_fullwidth_banner_raw.txt");
+        assert_eq!(filter_pytest_output(raw), raw);
+    }
+
+    #[test]
+    fn test_filter_pytest_indented_captured_header_is_not_a_failure() {
+        let raw = include_str!("../../../tests/fixtures/pytest_captured_indented_banner_raw.txt");
+        let filtered = filter_pytest_output(raw);
+        assert_eq!(filtered.matches("[FAIL]").count(), 1, "{filtered}");
+        assert!(filtered.contains("1. [FAIL] test_indented\n"), "{filtered}");
+        assert!(filtered.contains("real failure"), "{filtered}");
+        assert!(!filtered.contains("phantom"), "{filtered}");
+        assert!(!filtered.contains("captured diagnostic"), "{filtered}");
+    }
 
     #[test]
     fn test_filter_pytest_all_pass() {
