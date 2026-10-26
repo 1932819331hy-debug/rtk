@@ -468,7 +468,7 @@ fn format_dotnet_format_output(
     }
 
     output.push_str(&format!(
-        "\n\nok {} files already formatted\nRun `dotnet format` to apply fixes",
+        "\n\nok {} files already formatted\nRun `rtk dotnet format --write` to apply fixes",
         summary.files_unchanged
     ));
     output
@@ -3227,7 +3227,7 @@ mod tests {
         let output = format_dotnet_format_output(&summary, true);
         assert!(output.contains("Format: 2 files need formatting"));
         assert!(output.contains("src/Program.cs (line 42, col 17, WHITESPACE)"));
-        assert!(output.contains("Run `dotnet format` to apply fixes"));
+        assert!(output.contains("Run `rtk dotnet format --write` to apply fixes"));
     }
 
     #[test]
