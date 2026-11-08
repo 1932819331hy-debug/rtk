@@ -22,14 +22,8 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 
     let mode = detect_mode(args);
 
-    // No file operands → wc reads from stdin. Forward rtk's stdin to the child
-    // so `cat file | rtk wc` counts the piped data instead of reporting zero.
-    let reads_stdin = !args.iter().any(|a| !a.starts_with('-'));
-    let opts = if reads_stdin {
-        RunOptions::stdout_only().inherit_stdin()
-    } else {
-        RunOptions::stdout_only()
-    };
+    // Let wc decide when to read stdin, including a `-` mixed with file operands.
+    let opts = RunOptions::stdout_only().inherit_stdin();
 
     runner::run_filtered(
         cmd,

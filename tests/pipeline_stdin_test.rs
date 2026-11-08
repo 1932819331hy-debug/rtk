@@ -48,6 +48,65 @@ fn wc_reads_piped_stdin() {
 }
 
 #[test]
+fn wc_reads_explicit_stdin_alongside_file_operand() {
+    let dir = common::tempdir();
+    std::fs::write(dir.path().join("input.txt"), b"file one\nfile two\n")
+        .expect("write scratch input");
+    std::fs::write(dir.path().join("other.txt"), b"one\ntwo\nthree\nfour\n")
+        .expect("write second scratch input");
+    let input = b"pipe one\npipe two\npipe three\n";
+
+    let cases: &[(&[&str], &[u64])] = &[
+        (&["input.txt", "-"], &[2, 3, 5]),
+        (&["-", "input.txt"], &[3, 2, 5]),
+        (&[], &[3]),
+        (&["-"], &[3]),
+        (&["input.txt"], &[2]),
+        (&["input.txt", "other.txt"], &[2, 4, 6]),
+        (&["input.txt", "-", "other.txt"], &[2, 3, 4, 9]),
+        (&["input.txt", "-", "-"], &[2, 3, 0, 5]),
+    ];
+    for &(operands, expected) in cases {
+        let native = run_with_stdin(
+            common::native_command("wc")
+                .arg("-l")
+                .args(operands)
+                .current_dir(dir.path())
+                .env("LC_ALL", "C"),
+            input,
+        );
+        let rtk = run_with_stdin(
+            common::rtk_command()
+                .args(["wc", "-l"])
+                .args(operands)
+                .current_dir(dir.path())
+                .env("LC_ALL", "C"),
+            input,
+        );
+        let counts = |output: &[u8]| {
+            String::from_utf8_lossy(output)
+                .lines()
+                .map(|line| {
+                    line.split_whitespace()
+                        .find_map(|word| word.parse::<u64>().ok())
+                        .expect("wc output row has a count")
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert!(native.status.success());
+        assert_eq!(counts(&native.stdout), expected);
+        assert_eq!(rtk.status.code(), native.status.code());
+        assert_eq!(
+            counts(&rtk.stdout),
+            counts(&native.stdout),
+            "operands {operands:?}; rtk stdout: {}",
+            String::from_utf8_lossy(&rtk.stdout)
+        );
+    }
+}
+
+#[test]
 fn wc_preserves_native_failure_exit_code() {
     let invalid_option = "--definitely-invalid-rtk-test-option";
     let rtk = run_with_stdin(
